@@ -40,9 +40,17 @@ const DEFAULTS = {
 
 const SEVERITY_RANK = { none: 0, nit: 1, concern: 2, blocker: 3 };
 
-// How many consecutive settled-but-empty polls to tolerate before giving up, to absorb the lag
-// between a sub-agent reporting "idle" and its reply becoming readable.
-const SETTLED_EMPTY_POLL_LIMIT = 8;
+// A sub-agent can report "idle" before it has produced anything, so a settled-but-empty poll is
+// not proof of completion. Tolerate them for a fraction of the overall timeout rather than a
+// fixed count — a fixed 8 polls capped every review at 16s and made `timeoutMs` unreachable.
+const SETTLED_EMPTY_GRACE_FRACTION = 0.25;
+const MIN_SETTLED_EMPTY_POLLS = 8;
+
+function settledEmptyPollLimit() {
+    const interval = Math.max(cfg("pollIntervalMs"), 1);
+    const grace = cfg("timeoutMs") * SETTLED_EMPTY_GRACE_FRACTION;
+    return Math.max(MIN_SETTLED_EMPTY_POLLS, Math.ceil(grace / interval));
+}
 
 // `tasks.startAgent` accepts only these built-in agent types. Custom agents defined on disk are
 // not dispatchable through it, so the advisor cannot use one to pin its own reasoning effort.
@@ -82,6 +90,62 @@ const ADVISOR_TASK_DESCRIPTION = "Advisor review";
 // restating the same note each review.
 const VERDICT_HISTORY_LIMIT = 5;
 
+// Identical advice is suppressed only for this long. Permanent suppression would silence a
+// genuine repeat of the same mistake later in a long turn.
+const DUPLICATE_SUPPRESSION_MS = 5 * 60 * 1000;
+
+// Upper bound on cancelling and removing a finished review task.
+const DISPOSE_TIMEOUT_MS = 5000;
+
+// Minimum sane values for numeric keys. A zero or negative interval would dispatch a review on
+// every tool call or busy-loop the poller, and a bad value currently fails in confusing ways
+// rather than loudly.
+const NUMERIC_FLOORS = {
+    everyNToolCalls: 1,
+    immuneToolCalls: 0,
+    maxBackoffFactor: 1,
+    maxAdviceAgeMs: 0,
+    maxTranscriptChars: 500,
+    maxToolResultChars: 100,
+    timeoutMs: 5000,
+    pollIntervalMs: 250,
+};
+
+const LOG_LEVELS = ["info", "warning", "error"];
+
+// Rejected values fall back to the default rather than propagating. Reasons are returned so the
+// user can be told once, at startup, instead of silently getting different behaviour.
+function validateConfig(raw) {
+    const clean = { ...raw };
+    const problems = [];
+
+    for (const [key, floor] of Object.entries(NUMERIC_FLOORS)) {
+        const value = clean[key];
+        if (typeof value === "number" && Number.isFinite(value) && value >= floor) continue;
+        problems.push(`${key}=${JSON.stringify(value)} (must be a number >= ${floor})`);
+        clean[key] = DEFAULTS[key];
+    }
+
+    if (!(clean.minSeverityToInject in SEVERITY_RANK)) {
+        problems.push(
+            `minSeverityToInject=${JSON.stringify(clean.minSeverityToInject)}` +
+                ` (must be one of ${Object.keys(SEVERITY_RANK).join(", ")})`,
+        );
+        clean.minSeverityToInject = DEFAULTS.minSeverityToInject;
+    }
+
+    if (!LOG_LEVELS.includes(clean.timelineLevel)) {
+        problems.push(
+            `timelineLevel=${JSON.stringify(clean.timelineLevel)}` +
+                ` (must be one of ${LOG_LEVELS.join(", ")})`,
+        );
+        clean.timelineLevel = DEFAULTS.timelineLevel;
+    }
+
+    clean._problems = problems;
+    return clean;
+}
+
 function loadConfig(workingDirectory) {
     const candidates = [
         process.env.COPILOT_ADVISOR_CONFIG,
@@ -93,12 +157,18 @@ function loadConfig(workingDirectory) {
         try {
             if (!existsSync(path)) continue;
             const parsed = JSON.parse(readFileSync(path, "utf8"));
-            return { ...DEFAULTS, ...parsed, _configPath: path };
-        } catch {
-            // A malformed config must not take the extension down; fall through to defaults.
+            return { ...validateConfig({ ...DEFAULTS, ...parsed }), _configPath: path };
+        } catch (err) {
+            // A malformed config must not take the extension down, but it must not be silent
+            // either — the user gets default behaviour and no explanation otherwise.
+            return {
+                ...DEFAULTS,
+                _configPath: path,
+                _problems: [`could not read config: ${err?.message ?? err}`],
+            };
         }
     }
-    return { ...DEFAULTS, _configPath: null };
+    return { ...DEFAULTS, _configPath: null, _problems: [] };
 }
 
 let config = loadConfig(process.cwd());
@@ -112,6 +182,7 @@ const state = {
     pendingAdvice: null,
     pendingAdviceAt: 0,
     lastAdviceNote: "",
+    lastAdviceAt: 0,
     verdictHistory: [],
     consecutiveQuietChecks: 0,
     activeCalls: new Map(),
@@ -240,18 +311,18 @@ function collectInFlight() {
 }
 
 async function buildTranscriptDelta(session) {
-    let events = [];
-    try {
-        events = await session.getEvents();
-    } catch (err) {
-        state.lastError = `getEvents failed: ${err?.message ?? err}`;
-        return null;
-    }
+    // Throws rather than returning null on failure: the caller cannot distinguish "no activity"
+    // from "could not read activity", and a persistent read failure would otherwise stop reviews
+    // permanently and silently.
+    const events = await session.getEvents();
 
     const delta = events.slice(state.lastEventIndex);
     state.lastEventIndex = events.length;
 
-    const lines = delta.map(renderEvent).filter(Boolean);
+    // Sub-agent events carry an agentId; main-agent events do not. Without this filter the
+    // advisor's own verdict and its own file reads come back in the next delta rendered as things
+    // the main agent said and did, and other extensions' sub-agents get mixed in too.
+    const lines = delta.filter((e) => !e?.agentId).map(renderEvent).filter(Boolean);
     if (lines.length === 0) return null;
 
     // Keep the tail: the most recent activity is what needs reviewing.
@@ -344,14 +415,50 @@ or has already gone off the rails. This WILL interrupt it, so use it sparingly.
 functions, or requirements.${extra ? `\n\nAdditional project-specific instructions:\n${extra}` : ""}`;
 }
 
+// Extracts balanced {...} spans, respecting string literals and escapes. A naive non-greedy
+// regex stops at the first "}", so any note mentioning code — `else { }`, `${VAR}`, a regex —
+// truncates into invalid JSON and the whole verdict is lost.
+function balancedJsonCandidates(text) {
+    const candidates = [];
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (ch === "\\") escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+
+        if (ch === '"') inString = true;
+        else if (ch === "{") {
+            if (depth === 0) start = i;
+            depth++;
+        } else if (ch === "}" && depth > 0) {
+            depth--;
+            if (depth === 0) candidates.push(text.slice(start, i + 1));
+        }
+    }
+    return candidates;
+}
+
+// Returned when the reply could not be understood at all. Distinct from a genuine "none" so the
+// caller never mistakes a parse failure for a clean review.
+const UNPARSEABLE = { severity: "none", note: "", unparseable: true };
+
 function parseVerdict(raw) {
     if (!raw || typeof raw !== "string") return { severity: "none", note: "" };
 
     // The advisor may wrap its JSON in prose or a fenced block; take the last object that parses.
-    const matches = raw.match(/\{[\s\S]*?\}/g);
-    if (!matches) return { severity: "none", note: "" };
+    const candidates = balancedJsonCandidates(raw);
+    if (candidates.length === 0) return UNPARSEABLE;
 
-    for (const candidate of matches.reverse()) {
+    for (const candidate of candidates.reverse()) {
         try {
             const parsed = JSON.parse(candidate);
             if (typeof parsed?.severity !== "string") continue;
@@ -362,15 +469,19 @@ function parseVerdict(raw) {
             // Not the JSON we want; keep looking.
         }
     }
-    return { severity: "none", note: "" };
+    return UNPARSEABLE;
 }
 
-// The advisor's output flows into the main agent's context, so treat it as untrusted text.
+// The advisor's output flows into the main agent's context, so treat it as untrusted text. The
+// note is interpolated between real <advisor> delimiters, so angle brackets are escaped rather
+// than pattern-stripped — a note cannot then forge a tag of any shape.
 function sanitizeNote(note) {
     if (typeof note !== "string") return "";
-    let clean = note.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, " ").trim();
-    clean = clean.replace(/<\/?(system|instructions?|advisor)>/gi, "");
-    if (/ignore (all )?(your |the )?(previous|prior|above) instructions/i.test(clean)) return "";
+    const clean = note
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, " ")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .trim();
     return clean.slice(0, 800);
 }
 
@@ -441,8 +552,8 @@ async function runAdvisorAgent(session, prompt) {
 
             const task = tasks.find((t) => t.id === agentId);
             if (!task) {
-                // Disappeared before we ever saw it running — nothing to report.
-                if (seen) return "";
+                // Disappeared before we ever saw it running.
+                if (seen) throw new Error("advisor agent disappeared before returning a reply");
                 continue;
             }
             seen = true;
@@ -452,7 +563,7 @@ async function runAdvisorAgent(session, prompt) {
             );
 
             if (task.status === "failed") throw new Error(task.error || "advisor agent failed");
-            if (task.status === "cancelled") return "";
+            if (task.status === "cancelled") throw new Error("advisor agent was cancelled");
 
             // Exact correlation: keyed by the task id we own, so unlike event-log matching these
             // cannot pick up the self-learn extension's or the main agent's sub-agent.
@@ -474,12 +585,16 @@ async function runAdvisorAgent(session, prompt) {
                 return reply;
             }
 
-            // Guard against a sub-agent that settles without ever emitting a completion event.
+            // A sub-agent reports "idle" from the moment it starts, so this cannot simply mean
+            // "finished". Only give up once it has been settled without a reply for a while —
+            // and treat that as an error, never as a clean review.
             if (task.status === "completed" || task.status === "idle") {
-                if (++emptySettledPolls >= SETTLED_EMPTY_POLL_LIMIT) {
-                    debug(`${agentId} settled with no result after ${emptySettledPolls} polls`);
+                if (++emptySettledPolls >= settledEmptyPollLimit()) {
                     await dumpEventDiagnostics(session, baseline);
-                    return "";
+                    throw new Error(
+                        `advisor agent settled without producing a reply after ` +
+                            `${emptySettledPolls} polls`,
+                    );
                 }
             } else {
                 emptySettledPolls = 0;
@@ -507,18 +622,17 @@ async function readAgentReplyFromEventLog(session, toolCallId, baseline) {
 
     const recent = events.slice(baseline);
 
-    // The baseline is captured immediately before the sub-agent is started, so the first
-    // `subagent.started` after it is this review's. Prefer an explicit description or model
-    // match when the payload carries one, since the main agent may spawn its own sub-agents.
-    const candidates = recent.filter((e) => e?.type === "subagent.started" && e?.agentId);
-    const started =
-        candidates.find(
-            (e) =>
-                e?.data?.agentDescription === ADVISOR_TASK_DESCRIPTION ||
-                (toolCallId && e?.data?.toolCallId === toolCallId),
-        ) ??
-        candidates.find((e) => e?.data?.model && e.data.model === cfg("model")) ??
-        candidates[0];
+    // The baseline is captured immediately before the sub-agent is started, but other sub-agents
+    // can start in the same window — the main agent's own, or another extension's. Only an exact
+    // match is safe: guessing by model or by "first one after the baseline" would parse a foreign
+    // agent's message as this review's verdict.
+    const started = recent.find(
+        (e) =>
+            e?.type === "subagent.started" &&
+            e?.agentId &&
+            (e?.data?.agentDescription === ADVISOR_TASK_DESCRIPTION ||
+                (toolCallId && e?.data?.toolCallId === toolCallId)),
+    );
 
     if (!started) return { status: "pending", reply: "" };
 
@@ -561,13 +675,17 @@ async function dumpEventDiagnostics(session, baseline) {
 }
 
 async function disposeTask(rpc, agentId) {
+    // Bounded: an unresolved cancel would hold `checkInFlight` true forever and stop all reviews.
+    const bounded = (promise) =>
+        Promise.race([promise, new Promise((resolve) => setTimeout(resolve, DISPOSE_TIMEOUT_MS))]);
+
     try {
-        await rpc.tasks.cancel({ id: agentId });
+        await bounded(rpc.tasks.cancel({ id: agentId }));
     } catch {
         // Already settled.
     }
     try {
-        await rpc.tasks.remove({ id: agentId });
+        await bounded(rpc.tasks.remove({ id: agentId }));
     } catch {
         // Not removable; nothing more we can do.
     }
@@ -591,34 +709,49 @@ async function runCheck(session, { force = false } = {}) {
         const raw = await runAdvisorAgent(session, buildPrompt({ ...snapshot, planContext }));
         const advice = parseVerdict(raw);
         debug(
-            `verdict: ${advice.severity} | inFlight=${snapshot.inFlight.length}` +
+            `verdict: ${advice.severity}${advice.unparseable ? " [UNPARSEABLE]" : ""}` +
+                ` | inFlight=${snapshot.inFlight.length}` +
                 ` plan=${planContext ? "yes" : "no"} | raw=${truncate(raw, 300)}`,
         );
 
+        // A reply we could not understand is a failure, not a clean review. Treating it as "none"
+        // would hide it and widen the backoff, making the advisor quietly review less and less.
+        if (advice.unparseable) {
+            throw new Error(`advisor reply could not be parsed: ${truncate(raw, 200)}`);
+        }
+
         if (advice.severity === "none" || !advice.note) {
             state.consecutiveQuietChecks++;
-            if (force && cfg("logToTimeline")) {
-                await session.log("advisor: no concerns", { level: cfg("timelineLevel") });
-            }
+            if (force) await report("advisor: no concerns");
             return { severity: "none" };
         }
 
-        // Don't repeat identical advice the agent has already been given.
-        if (advice.note === state.lastAdviceNote) return { skipped: "duplicate advice" };
+        // Don't repeat advice the agent was recently given, but never suppress a blocker and
+        // never let suppression outlive the situation that produced it.
+        if (
+            advice.severity !== "blocker" &&
+            advice.note === state.lastAdviceNote &&
+            Date.now() - state.lastAdviceAt < DUPLICATE_SUPPRESSION_MS
+        ) {
+            recordAdvice(advice.severity, advice.note, "dropped, duplicate");
+            return { skipped: "duplicate advice" };
+        }
 
         if (SEVERITY_RANK[advice.severity] < SEVERITY_RANK[cfg("minSeverityToInject")]) {
+            recordAdvice(advice.severity, advice.note, "dropped, below minSeverityToInject");
             return { skipped: `below minSeverityToInject (${advice.severity})` };
         }
 
         state.pendingAdvice = advice;
         state.pendingAdviceAt = Date.now();
         state.lastAdviceNote = advice.note;
+        state.lastAdviceAt = Date.now();
         state.consecutiveQuietChecks = 0;
         state.verdictHistory.push(`[${advice.severity}] ${truncate(advice.note, 200)}`);
         if (state.verdictHistory.length > VERDICT_HISTORY_LIMIT) state.verdictHistory.shift();
 
         if (cfg("logToTimeline")) {
-            await session.log(formatTimelineAdvice(advice), { level: cfg("timelineLevel") });
+            await report(formatTimelineAdvice(advice));
         }
         recordAdvice(advice.severity, advice.note, "raised");
         return advice;
@@ -684,6 +817,10 @@ const session = await joinSession({
             if (!advice) return;
 
             if (advice.severity === "blocker" && cfg("blockOnBlocker")) {
+                // A denied call never runs, so no post hook fires to clear it. Left in place it
+                // would be shown to the next review as "executing right now", which could produce
+                // a blocker against a call that was already blocked.
+                markCallFinished(input?.toolName, input?.toolArgs);
                 debug(`delivering BLOCKER (denying tool call): ${advice.note}`);
                 recordAdvice(advice.severity, advice.note, `DENIED tool call: ${input?.toolName}`);
                 return {
@@ -736,7 +873,8 @@ const session = await joinSession({
             description: "Run an advisor review right now",
             handler: async () => {
                 await report("advisor: reviewing…");
-                await runCheck(session, { force: true });
+                const result = await runCheck(session, { force: true });
+                if (result?.skipped) await report(`advisor: skipped — ${result.skipped}`);
             },
         },
         {
@@ -840,14 +978,15 @@ const session = await joinSession({
 async function report(message) {
     try {
         await session.log(message, { level: cfg("timelineLevel") });
-    } catch {
-        // Nothing useful to do if the host rejects the log.
+    } catch (err) {
+        // This is the only channel to the user, so a failure here makes everything invisible.
+        // It must at least reach the debug log.
+        debug(`report failed (level=${cfg("timelineLevel")}): ${err?.message ?? err}`);
     }
 }
 
 function countToolCall(toolName, invocation) {
     if (!cfg("enabled")) return;
-    if (typeof toolName === "string" && toolName.startsWith("advisor")) return;
 
     state.toolCallsThisTurn++;
     state.toolCallsSinceCheck++;
@@ -871,7 +1010,10 @@ function currentInterval() {
     return Math.max(base, Math.round(base * factor));
 }
 
-state.sessionSuffix = (session.sessionId ?? "").slice(0, 8) || "unknown";
+// Falls back to a random suffix rather than a shared literal, so sessions without an id do not
+// all interleave into one file — the very problem suffixing exists to prevent.
+state.sessionSuffix =
+    (session.sessionId ?? "").slice(0, 8) || `anon${Math.random().toString(36).slice(2, 8)}`;
 
 // The configured log paths are shared by every session, so they are suffixed per session. Make
 // sure the directory exists and tell the user exactly where this session's advice will land.
@@ -890,22 +1032,12 @@ await session.log(
     { ephemeral: true },
 );
 
-// Diagnostic for working out which log variants the host actually renders. Advice was emitted
-// with `level` and no `ephemeral` flag and never appeared, while the ephemeral startup line did,
-// so the two differ in a way that matters. Enable `surfaceTest` and reload to see which reach
-// the UI.
-if (cfg("surfaceTest")) {
-    const variants = [
-        ["SURFACE 1 — ephemeral, no level", { ephemeral: true }],
-        ["SURFACE 2 — level info, persisted", { level: "info" }],
-        ["SURFACE 3 — level info, ephemeral", { level: "info", ephemeral: true }],
-        ["SURFACE 4 — level warning, persisted", { level: "warning" }],
-        ["SURFACE 5 — level error, persisted", { level: "error" }],
-        ["SURFACE 6 — no options at all", undefined],
-    ];
-    for (const [message, options] of variants) {
-        await session.log(message, options).catch(() => {});
-    }
+// A rejected config value silently changes behaviour, so say so once at startup.
+if (config._problems?.length) {
+    await report(
+        `advisor: ignoring invalid config in ${config._configPath}\n` +
+            config._problems.map((p) => `  ${p}`).join("\n"),
+    );
 }
 
 // Advice is normally delivered on the next tool call. A turn that ends without one would drop
