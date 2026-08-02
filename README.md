@@ -158,6 +158,20 @@ Advice is delivered into the agent's context, where you cannot see it. Two thing
 Log paths are suffixed with the session id, because otherwise concurrent sessions interleave
 their entries into a single unreadable file.
 
+## Development
+
+```
+node --check extension.mjs            # syntax
+node scripts/test-parse.mjs           # verdict parsing and note sanitisation
+node scripts/check-config-keys.mjs    # DEFAULTS vs example vs README table
+node scripts/check-config-usage.mjs   # every cfg() key declared, every key used
+```
+
+The parsing tests matter more than their size suggests: they cover the path that turns untrusted
+model output into a decision that can block a tool call. A real bug lived there — a non-greedy
+regex meant any note mentioning code truncated into invalid JSON and the verdict was silently
+discarded as "no concerns".
+
 ## Design notes
 
 - **Non-blocking.** The review runs as a detached background task; the main agent never waits.
@@ -168,10 +182,14 @@ their entries into a single unreadable file.
   the extension records the event count before starting, finds the `subagent.started` event
   after that baseline, and reads the last `assistant.message` carrying the same internal
   `agentId` (`bg-…`) once `subagent.completed` appears.
-- **Untrusted output.** The advisor's note ends up in the main agent's context, so it is
-  stripped of control characters and tag-like text, checked for instruction-override phrasing,
-  and capped at 800 characters. It is wrapped in an `<advisor>` block that tells the main agent
-  the source is fallible.
+- **Untrusted output.** The advisor's note is injected into the main agent's context and can deny
+  a tool call, so it is stripped of control characters, has angle brackets escaped so it cannot
+  forge a structural tag, and is capped at 800 characters. It is wrapped in an `<advisor>` block
+  that tells the main agent the source is fallible.
+- **Failures are loud.** Every give-up path raises an error rather than returning an empty
+  verdict, because an empty verdict reads as "no concerns" — which both hides the failure and,
+  by counting as a quiet review, widens the backoff so reviews become rarer. Errors surface once
+  per distinct message; failures that cannot succeed on retry disable the advisor and say so.
 - **Emission guard.** One piece of advice per review, identical consecutive notes are dropped,
   and no new review starts while one is in flight or while advice is still pending.
 - **Incremental transcript.** Each review sees only what happened since the previous one, plus
