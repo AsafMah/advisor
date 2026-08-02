@@ -143,6 +143,12 @@ configured cadence immediately. `/advisor` shows the live interval and quiet str
 - **Advice is never silently lost.** Delivery normally happens on the next tool call, but a turn
   that ends without one would drop it, so anything still pending is flushed to the timeline on
   `session.idle`.
+- **Transcripts are sent unredacted.** Tool results reach the advisor as-is, including anything
+  sensitive that appeared in their output. This is deliberate: the advisor is an ordinary
+  sub-agent of the same session, running on the same provider under the same trust boundary, so
+  redacting for it would protect nothing the main agent has not already seen. oh-my-pi obfuscates
+  secrets before handing them to its advisor; that only matters where the advisor is less trusted
+  than the agent it watches, which is not the case here.
 - **Self-cleanup.** A sub-agent parks in `idle` forever and would accumulate in the task list,
   so each review's task is cancelled and removed once its reply has been read.
 
@@ -157,8 +163,6 @@ configured cadence immediately. `/advisor` shows the live interval and quiet str
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.
 - Reloading extensions mid-review orphans that review's sub-agent in the `idle` state.
-- Tool results are sent to the advisor model unredacted, so a transcript may carry secrets that
-  appeared in tool output. There is no obfuscation pass yet.
 - The `blocker` deny path and the `session.idle` flush are implemented but have not been observed
   firing in a real session.
 
