@@ -154,8 +154,15 @@ configured cadence immediately. `/advisor` shows the live interval and quiet str
 
 ## Known limitations
 
-- The RPC surface for starting a sub-agent accepts a `model` but no reasoning-effort override,
-  so the advisor runs at that model's default effort.
+- **Reasoning effort cannot be controlled.** `startAgent` takes a `model` but no effort
+  parameter, and it accepts only built-in agent types — `explore`, `task`, `general-purpose`,
+  `rubber-duck`, `code-review`, `research`, `security-review`. A custom agent on disk can carry
+  its own `model` and `reasoningEffort`, but is rejected with `Unknown agent type`, so it cannot
+  be used to pin the advisor's effort. The review therefore runs at the backend's default effort
+  for the chosen model; per the SDK, the parent session's effort is *not* inherited. The only
+  remaining levers are `subagents.agents["rubber-duck"].effortLevel` in `settings.json` or a live
+  override via `rpc.tools.updateSubagentSettings`, both of which also affect any `rubber-duck`
+  agent you dispatch yourself.
 - Every review emits an "agent finished" system notification into the main agent's context.
   This is runtime behaviour for background agents and cannot currently be suppressed.
 - Advice cannot interrupt mid-stream — it is delivered at the next tool-call boundary. An agent
@@ -163,8 +170,7 @@ configured cadence immediately. `/advisor` shows the live interval and quiet str
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.
 - Reloading extensions mid-review orphans that review's sub-agent in the `idle` state.
-- The `blocker` deny path and the `session.idle` flush are implemented but have not been observed
-  firing in a real session.
+- The `session.idle` flush is implemented but has not been observed firing in a real session.
 
 ## Debugging
 
