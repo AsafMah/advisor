@@ -4,9 +4,9 @@
 // Inspired by oh-my-pi's WATCHDOG advisor. See README.md.
 
 import { joinSession } from "@github/copilot-sdk/extension";
-import { readFileSync, existsSync, appendFileSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 const DEFAULTS = {
     enabled: true,
@@ -50,6 +50,12 @@ const BUILTIN_AGENT_TYPES = [
     "research",
     "security-review",
 ];
+
+// Separates advice entries in the log. A visible marker is unsafe: advice text may itself contain
+// a markdown heading at line start. U+001E (record separator) is guaranteed absent from notes
+// because `sanitizeNote` strips that control range, and it renders as nothing in a text viewer,
+// so the file stays readable.
+const ADVICE_ENTRY_SEPARATOR = "\u001e";
 
 // Distinctive description stamped on the sub-agent so its events can be identified in the
 // session event log. RPC-started agents have no parent tool call to correlate on.
@@ -97,12 +103,25 @@ const state = {
     lastError: null,
     lastReportedError: null,
     sessionOverrides: {},
+    sessionSuffix: "",
 };
 
 const cfg = (key) => state.sessionOverrides[key] ?? config[key];
 
+// Every session writes to the same configured path, so without a per-session suffix concurrent
+// sessions interleave their entries into one unreadable file.
+function sessionScopedPath(configuredPath) {
+    if (!configuredPath) return null;
+    if (!state.sessionSuffix) return configuredPath;
+
+    const dot = configuredPath.lastIndexOf(".");
+    const slash = Math.max(configuredPath.lastIndexOf("\\"), configuredPath.lastIndexOf("/"));
+    if (dot <= slash) return `${configuredPath}-${state.sessionSuffix}`;
+    return `${configuredPath.slice(0, dot)}-${state.sessionSuffix}${configuredPath.slice(dot)}`;
+}
+
 function debug(message) {
-    const path = cfg("debugLog");
+    const path = sessionScopedPath(cfg("debugLog"));
     if (!path) return;
     try {
         appendFileSync(path, `${new Date().toISOString()} ${message}\n`);
@@ -112,13 +131,13 @@ function debug(message) {
 }
 
 // Advice is delivered into the main agent's context, where the user cannot see it. This is the
-// human-readable record of what the advisor actually said — tail it to watch reviews live:
-//   Get-Content ~\.copilot\logs\advisor-advice.log -Wait
+// human-readable record of what the advisor actually said. Use /advisor-log to read it, or tail
+// the file printed at startup.
 function recordAdvice(severity, note, outcome) {
-    const path = cfg("adviceLog");
+    const path = sessionScopedPath(cfg("adviceLog"));
     if (!path) return;
     const stamp = new Date().toLocaleTimeString();
-    const entry = `\n[${stamp}] ${severity.toUpperCase()} (${outcome})\n${note}\n`;
+    const entry = `${ADVICE_ENTRY_SEPARATOR}\n### [${stamp}] ${severity.toUpperCase()} (${outcome})\n${note}\n`;
     try {
         appendFileSync(path, entry);
     } catch {
@@ -673,6 +692,7 @@ const session = await joinSession({
                     `cadence:        every ${cfg("everyNToolCalls")} tool calls (currently ${currentInterval()}, immune for first ${cfg("immuneToolCalls")})`,
                     `block on:       ${cfg("blockOnBlocker") ? "blocker" : "nothing"}`,
                     `config:         ${config._configPath ?? "built-in defaults"}`,
+                    `advice log:     ${sessionScopedPath(cfg("adviceLog")) ?? "disabled"}`,
                     `checks run:     ${state.checksRun}`,
                     `advice given:   ${state.adviceDelivered}`,
                     `tool calls:     ${state.toolCallsSinceCheck}/${currentInterval()} since last check`,
@@ -681,14 +701,14 @@ const session = await joinSession({
                     `pending advice: ${state.pendingAdvice ? state.pendingAdvice.severity : "none"}`,
                     `last error:     ${state.lastError ?? "none"}`,
                 ];
-                await session.log(`advisor status\n${lines.join("\n")}`);
+                await report(`advisor status\n${lines.join("\n")}`);
             },
         },
         {
             name: "advisor-check",
             description: "Run an advisor review right now",
             handler: async () => {
-                await session.log("advisor: reviewing…", { ephemeral: true });
+                await report("advisor: reviewing…");
                 await runCheck(session, { force: true });
             },
         },
@@ -697,7 +717,7 @@ const session = await joinSession({
             description: "Enable the advisor for this session",
             handler: async () => {
                 state.sessionOverrides.enabled = true;
-                await session.log("advisor: enabled");
+                await report("advisor: enabled");
             },
         },
         {
@@ -706,7 +726,7 @@ const session = await joinSession({
             handler: async () => {
                 state.sessionOverrides.enabled = false;
                 state.pendingAdvice = null;
-                await session.log("advisor: disabled");
+                await report("advisor: disabled");
             },
         },
         {
@@ -715,11 +735,11 @@ const session = await joinSession({
             handler: async (ctx) => {
                 const model = ctx.args?.trim();
                 if (!model) {
-                    await session.log(`advisor model: ${cfg("model")}`);
+                    await report(`advisor model: ${cfg("model")}`);
                     return;
                 }
                 state.sessionOverrides.model = model;
-                await session.log(`advisor model set to ${model}`);
+                await report(`advisor model set to ${model}`);
             },
         },
         {
@@ -728,11 +748,51 @@ const session = await joinSession({
             handler: async (ctx) => {
                 const n = Number.parseInt(ctx.args?.trim(), 10);
                 if (!Number.isFinite(n) || n < 1) {
-                    await session.log(`advisor cadence: every ${cfg("everyNToolCalls")} tool calls`);
+                    await report(`advisor cadence: every ${cfg("everyNToolCalls")} tool calls`);
                     return;
                 }
                 state.sessionOverrides.everyNToolCalls = n;
-                await session.log(`advisor will review every ${n} tool calls`);
+                await report(`advisor will review every ${n} tool calls`);
+            },
+        },
+        {
+            name: "advisor-log",
+            description: "Show recent advisor advice for this session, e.g. /advisor-log 10",
+            handler: async (ctx) => {
+                const path = sessionScopedPath(cfg("adviceLog"));
+                if (!path) {
+                    await report("advisor: adviceLog is disabled in config");
+                    return;
+                }
+                if (!existsSync(path)) {
+                    await report(`advisor: no advice recorded yet this session\n${path}`);
+                    return;
+                }
+
+                const requested = Number.parseInt(ctx.args?.trim(), 10);
+                const count = Number.isFinite(requested) && requested > 0 ? requested : 5;
+
+                let entries;
+                try {
+                    entries = readFileSync(path, "utf8")
+                        .split(ADVICE_ENTRY_SEPARATOR)
+                        .map((e) => e.trim())
+                        .filter(Boolean);
+                } catch (err) {
+                    await report(`advisor: could not read ${path}\n${err?.message ?? err}`);
+                    return;
+                }
+
+                if (entries.length === 0) {
+                    await report(`advisor: no advice recorded yet this session\n${path}`);
+                    return;
+                }
+
+                const shown = entries.slice(-count);
+                await report(
+                    `advisor — last ${shown.length} of ${entries.length} advice entries\n${path}\n\n` +
+                        shown.join("\n\n"),
+                );
             },
         },
         {
@@ -741,11 +801,21 @@ const session = await joinSession({
             handler: async () => {
                 config = loadConfig(process.cwd());
                 state.sessionOverrides = {};
-                await session.log(`advisor config reloaded from ${config._configPath ?? "built-in defaults"}`);
+                await report(`advisor config reloaded from ${config._configPath ?? "built-in defaults"}`);
             },
         },
     ],
 });
+
+// Command output and advice must go out at a level the host actually renders — see the comment
+// on `timelineLevel`. A plain `session.log` at info level is silently swallowed.
+async function report(message) {
+    try {
+        await session.log(message, { level: cfg("timelineLevel") });
+    } catch {
+        // Nothing useful to do if the host rejects the log.
+    }
+}
 
 function countToolCall(toolName, invocation) {
     if (!cfg("enabled")) return;
@@ -773,9 +843,22 @@ function currentInterval() {
     return Math.max(base, Math.round(base * factor));
 }
 
+state.sessionSuffix = (session.sessionId ?? "").slice(0, 8) || "unknown";
+
+// The configured log paths are shared by every session, so they are suffixed per session. Make
+// sure the directory exists and tell the user exactly where this session's advice will land.
+const adviceLogPath = sessionScopedPath(cfg("adviceLog"));
+if (adviceLogPath) {
+    try {
+        mkdirSync(dirname(adviceLogPath), { recursive: true });
+    } catch {
+        // Directory creation is best effort; recordAdvice fails quietly if it did not work.
+    }
+}
+
 await session.log(
     `advisor ready — ${cfg("model") ?? "agent default"} every ${cfg("everyNToolCalls")} tool calls` +
-        `${config._configPath ? ` (config: ${config._configPath})` : ""}`,
+        `${adviceLogPath ? `\nadvice log: ${adviceLogPath}  (/advisor-log to read)` : ""}`,
     { ephemeral: true },
 );
 

@@ -88,7 +88,8 @@ See `advisor.example.json`. Keys:
 
 | Command                 | Purpose                                    |
 | ----------------------- | ------------------------------------------ |
-| `/advisor`              | Status: cadence, counters, last error.     |
+| `/advisor`              | Status: cadence, counters, advice log path, last error. |
+| `/advisor-log [n]`      | Show the last n pieces of advice for this session (default 5). |
 | `/advisor-check`        | Force a review right now.                  |
 | `/advisor-on`           | Enable for this session.                   |
 | `/advisor-off`          | Disable for this session.                  |
@@ -121,6 +122,19 @@ than restating the same note every review.
 Reviews are expensive and most find nothing, so the interval doubles after each quiet review —
 `everyNToolCalls` → 2× → 4× — capped at `maxBackoffFactor`. Any `nit` or higher resets it to the
 configured cadence immediately. `/advisor` shows the live interval and quiet streak.
+
+## Seeing the advice
+
+Advice is delivered into the agent's context, where you cannot see it. Two things make it visible:
+
+- **The timeline.** Each piece of advice is logged with a banner. Note that this host renders
+  **only `error`-level** extension logs — `info` and `warning` are persisted but never displayed —
+  so `timelineLevel` defaults to `error` and the real severity is carried in the message text.
+- **The advice log.** A human-readable record of every outcome: raised, injected, denied, dropped
+  as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup.
+
+Log paths are suffixed with the session id, because otherwise concurrent sessions interleave
+their entries into a single unreadable file.
 
 ## Design notes
 
