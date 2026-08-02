@@ -28,8 +28,12 @@ const DEFAULTS = {
 const SEVERITY_RANK = { none: 0, nit: 1, concern: 2, blocker: 3 };
 
 // How many consecutive settled-but-empty polls to tolerate before giving up, to absorb the lag
-// between a sub-agent reporting "idle" and its result becoming readable.
+// between a sub-agent reporting "idle" and its reply becoming readable.
 const SETTLED_EMPTY_POLL_LIMIT = 8;
+
+// Distinctive description stamped on the sub-agent so its events can be identified in the
+// session event log. RPC-started agents have no parent tool call to correlate on.
+const ADVISOR_TASK_DESCRIPTION = "Advisor review";
 
 function loadConfig(workingDirectory) {
     const candidates = [
@@ -208,14 +212,21 @@ async function runAdvisorAgent(session, prompt) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
 
+    let baseline = 0;
+    try {
+        baseline = (await session.getEvents()).length;
+    } catch {
+        baseline = 0;
+    }
+
     const { agentId } = await rpc.tasks.startAgent({
         agentType: cfg("agentType"),
         prompt,
         name: "advisor",
-        description: "Advisor review",
+        description: ADVISOR_TASK_DESCRIPTION,
         model: cfg("model"),
     });
-    debug(`started advisor agent ${agentId} on ${cfg("model")}`);
+    debug(`started advisor agent ${agentId} on ${cfg("model")} (event baseline ${baseline})`);
 
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
@@ -239,18 +250,26 @@ async function runAdvisorAgent(session, prompt) {
                 continue;
             }
             seen = true;
-            debug(`poll ${agentId}: status=${task.status} resultLen=${task.result?.length ?? "null"}`);
+            debug(
+                `poll ${agentId}: status=${task.status} resultLen=${task.result?.length ?? "null"}` +
+                    ` toolCallId=${task.toolCallId ?? "null"}`,
+            );
 
             if (task.status === "failed") throw new Error(task.error || "advisor agent failed");
             if (task.status === "cancelled") return "";
+            if (task.result) return task.result;
 
-            // A multi-turn agent parks in "idle" after answering rather than "completed", and
-            // a freshly-started agent can also report "idle" before it has produced anything.
-            // Only a non-empty result means the review is actually done.
+            // The task parks in "idle" without ever exposing a result, so the event log is the
+            // real completion signal.
+            const { status, reply } = await readAgentReplyFromEventLog(session, task.toolCallId, baseline);
+            if (status === "failed") throw new Error(reply);
+            if (status === "done") return reply;
+
+            // Guard against a sub-agent that settles without ever emitting a completion event.
             if (task.status === "completed" || task.status === "idle") {
-                if (task.result) return task.result;
                 if (++emptySettledPolls >= SETTLED_EMPTY_POLL_LIMIT) {
                     debug(`${agentId} settled with no result after ${emptySettledPolls} polls`);
+                    await dumpEventDiagnostics(session, baseline);
                     return "";
                 }
             } else {
@@ -261,6 +280,74 @@ async function runAdvisorAgent(session, prompt) {
     } finally {
         // The agent parks idle and would otherwise accumulate in the task list forever.
         await disposeTask(rpc, agentId);
+    }
+}
+
+// `tasks.list()` leaves `result` null for a sub-agent that parks in "idle", so the reply has to be
+// recovered from the session event log. Sub-agent events are tagged with an internal agent id
+// (`bg-…`) that differs from the task id (`advisor-…`). An agent started over RPC has no parent
+// tool invocation, so `toolCallId` cannot be relied on for correlation — match on the sub-agent's
+// description instead, scoped to events emitted after this review began.
+async function readAgentReplyFromEventLog(session, toolCallId, baseline) {
+    let events = [];
+    try {
+        events = await session.getEvents();
+    } catch {
+        return { status: "pending", reply: "" };
+    }
+
+    const recent = events.slice(baseline);
+
+    // The baseline is captured immediately before the sub-agent is started, so the first
+    // `subagent.started` after it is this review's. Prefer an explicit description or model
+    // match when the payload carries one, since the main agent may spawn its own sub-agents.
+    const candidates = recent.filter((e) => e?.type === "subagent.started" && e?.agentId);
+    const started =
+        candidates.find(
+            (e) =>
+                e?.data?.agentDescription === ADVISOR_TASK_DESCRIPTION ||
+                (toolCallId && e?.data?.toolCallId === toolCallId),
+        ) ??
+        candidates.find((e) => e?.data?.model && e.data.model === cfg("model")) ??
+        candidates[0];
+
+    if (!started) return { status: "pending", reply: "" };
+
+    const internalId = started.agentId;
+    const mine = (e) => e?.agentId === internalId;
+
+    const failed = recent.find((e) => e?.type === "subagent.failed" && mine(e));
+    if (failed) return { status: "failed", reply: failed?.data?.error ?? "sub-agent failed" };
+
+    if (!recent.some((e) => e?.type === "subagent.completed" && mine(e))) {
+        return { status: "pending", reply: "" };
+    }
+
+    const replies = recent
+        .filter((e) => e?.type === "assistant.message" && mine(e))
+        .map((e) => e?.data?.content)
+        .filter((c) => typeof c === "string" && c.trim());
+
+    if (replies.length === 0) return { status: "done", reply: "" };
+    debug(`recovered reply for ${internalId} from event log (${replies.length} message(s))`);
+    return { status: "done", reply: replies[replies.length - 1] };
+}
+
+// Emitted once when a review yields nothing, so an unexpected event shape can be diagnosed
+// without rebuilding the extension.
+async function dumpEventDiagnostics(session, baseline) {
+    let events = [];
+    try {
+        events = await session.getEvents();
+    } catch {
+        return;
+    }
+    const recent = events.slice(baseline);
+    const summary = recent.map((e) => `${e?.type}${e?.agentId ? `@${e.agentId}` : ""}`).join(", ");
+    debug(`event diagnostics since baseline ${baseline}: ${truncate(summary, 2000)}`);
+
+    for (const e of recent.filter((e) => String(e?.type).startsWith("subagent."))) {
+        debug(`  ${e.type} agentId=${e.agentId} data=${truncate(JSON.stringify(e.data), 600)}`);
     }
 }
 

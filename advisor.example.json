@@ -11,5 +11,6 @@
     "timeoutMs": 180000,
     "pollIntervalMs": 2000,
     "logToTimeline": true,
+    "debugLog": null,
     "instructions": ""
 }

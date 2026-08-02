@@ -79,6 +79,7 @@ See `advisor.example.json`. Keys:
 | `maxToolResultChars`  | `1200`           | Per-tool-result truncation inside the transcript.                        |
 | `timeoutMs`           | `180000`         | How long to wait for the advisor sub-agent.                              |
 | `logToTimeline`       | `true`           | Surface advice in the session timeline so you can see it too.            |
+| `debugLog`            | `~/.copilot/logs/advisor.log` | Trace file for the review loop. Set to `null` to disable. |
 | `instructions`        | `""`             | Extra project-specific review instructions appended to the prompt.       |
 
 ## Commands
@@ -99,6 +100,12 @@ Session overrides are in-memory and reset when extensions reload.
 
 - **Non-blocking.** The review runs as a detached background task; the main agent never waits.
   Advice lands on the next tool call after the advisor finishes.
+- **Reply recovery.** `tasks.list()` reports the sub-agent as `idle` but leaves `result` null
+  permanently, and the `toolCallId` it reports for an RPC-started agent is a stub (the agent
+  name), not a real tool call id. The reply is therefore recovered from the session event log:
+  the extension records the event count before starting, finds the `subagent.started` event
+  after that baseline, and reads the last `assistant.message` carrying the same internal
+  `agentId` (`bg-…`) once `subagent.completed` appears.
 - **Untrusted output.** The advisor's note ends up in the main agent's context, so it is
   stripped of control characters and tag-like text, checked for instruction-override phrasing,
   and capped at 800 characters. It is wrapped in an `<advisor>` block that tells the main agent
@@ -107,12 +114,24 @@ Session overrides are in-memory and reset when extensions reload.
   and no new review starts while one is in flight or while advice is still pending.
 - **Incremental transcript.** Each review sees only what happened since the previous one, plus
   the user's original goal.
+- **Self-cleanup.** A sub-agent parks in `idle` forever and would accumulate in the task list,
+  so each review's task is cancelled and removed once its reply has been read.
 
 ## Known limitations
 
 - The RPC surface for starting a sub-agent accepts a `model` but no reasoning-effort override,
   so the advisor runs at that model's default effort.
+- Every review emits an "agent finished" system notification into the main agent's context.
+  This is runtime behaviour for background agents and cannot currently be suppressed.
 - Advice cannot interrupt mid-stream — it is delivered at the next tool-call boundary. An agent
   that stops calling tools and answers directly will not be reviewed before it replies.
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.
+- Reloading extensions mid-review orphans that review's sub-agent in the `idle` state.
+
+## Debugging
+
+Set `debugLog` (default `~/.copilot/logs/advisor.log`) to trace the review loop: check start,
+sub-agent id and model, per-poll task status, reply recovery, parsed verdict, and delivery. When
+a review settles without a reply, the extension dumps the event types and `subagent.*` payloads
+seen since the baseline so the correlation can be diagnosed without rebuilding.
