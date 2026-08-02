@@ -14,6 +14,8 @@ const DEFAULTS = {
     agentType: "rubber-duck",
     everyNToolCalls: 12,
     immuneToolCalls: 4,
+    backoff: true,
+    maxBackoffFactor: 8,
     blockOnBlocker: true,
     minSeverityToInject: "nit",
     maxTranscriptChars: 24000,
@@ -34,6 +36,10 @@ const SETTLED_EMPTY_POLL_LIMIT = 8;
 // Distinctive description stamped on the sub-agent so its events can be identified in the
 // session event log. RPC-started agents have no parent tool call to correlate on.
 const ADVISOR_TASK_DESCRIPTION = "Advisor review";
+
+// How many past verdicts the advisor is shown, so it can spot a repeated failure rather than
+// restating the same note each review.
+const VERDICT_HISTORY_LIMIT = 5;
 
 function loadConfig(workingDirectory) {
     const candidates = [
@@ -64,6 +70,9 @@ const state = {
     checkInFlight: false,
     pendingAdvice: null,
     lastAdviceNote: "",
+    verdictHistory: [],
+    consecutiveQuietChecks: 0,
+    activeCalls: new Map(),
     checksRun: 0,
     adviceDelivered: 0,
     lastError: null,
@@ -95,6 +104,8 @@ function renderEvent(event) {
             return d.content ? `USER: ${truncate(d.content, 2000)}` : null;
         case "assistant.message":
             return d.content ? `AGENT: ${truncate(d.content, 2000)}` : null;
+        case "assistant.intent":
+            return d.intent ? `AGENT_INTENT: ${truncate(d.intent, 400)}` : null;
         case "tool.execution_start":
             return `TOOL_CALL ${d.toolName}: ${truncate(d.arguments, 600)}`;
         case "tool.execution_complete": {
@@ -105,6 +116,54 @@ function renderEvent(event) {
         default:
             return null;
     }
+}
+
+// Tool calls that have started but not finished — what the agent is doing right now. Without
+// these the advisor only ever sees the past and can react to a mistake but never prevent one.
+//
+// These are tracked from the hook payloads rather than derived from `tool.execution_start`
+// events, because at hook time the corresponding event may not have been emitted yet and the
+// derivation would silently yield nothing. The hooks carry `toolName`/`toolArgs` authoritatively.
+// Hook payloads have no call id, so identical concurrent calls are counted rather than keyed.
+const MAX_ACTIVE_CALL_AGE_MS = 10 * 60 * 1000;
+
+function callKey(toolName, toolArgs) {
+    return `${toolName}\u0000${truncate(toolArgs, 400)}`;
+}
+
+function markCallStarted(toolName, toolArgs) {
+    if (!toolName) return;
+    const key = callKey(toolName, toolArgs);
+    const entry = state.activeCalls.get(key);
+    if (entry) {
+        entry.count++;
+        entry.startedAt = Date.now();
+    } else {
+        state.activeCalls.set(key, { toolName, toolArgs, count: 1, startedAt: Date.now() });
+    }
+}
+
+function markCallFinished(toolName, toolArgs) {
+    if (!toolName) return;
+    const key = callKey(toolName, toolArgs);
+    const entry = state.activeCalls.get(key);
+    if (!entry) return;
+    if (--entry.count <= 0) state.activeCalls.delete(key);
+}
+
+// A tool call that is aborted never reaches a post hook, so its entry would leak.
+function pruneActiveCalls() {
+    const cutoff = Date.now() - MAX_ACTIVE_CALL_AGE_MS;
+    for (const [key, entry] of state.activeCalls) {
+        if (entry.startedAt < cutoff) state.activeCalls.delete(key);
+    }
+}
+
+function collectInFlight() {
+    pruneActiveCalls();
+    return [...state.activeCalls.values()].map(
+        (e) => `${e.toolName}${e.count > 1 ? ` (x${e.count})` : ""}: ${truncate(e.toolArgs, 600)}`,
+    );
 }
 
 async function buildTranscriptDelta(session) {
@@ -126,34 +185,76 @@ async function buildTranscriptDelta(session) {
     let text = lines.join("\n\n");
     const limit = cfg("maxTranscriptChars");
     if (text.length > limit) text = `…[earlier activity omitted]\n\n${text.slice(-limit)}`;
-    return text;
+
+    // Captured from live hook state rather than the event log, so it reflects calls that are
+    // executing at this instant.
+    return { transcript: text, inFlight: collectInFlight() };
 }
 
-function buildPrompt(transcript) {
+// The plan and todo list are what the user actually asked for, distilled. Without them the
+// advisor has to infer intent from the transcript and can only guess at drift.
+async function readPlanContext(session) {
+    const parts = [];
+
+    try {
+        const plan = await session.rpc.plan.read();
+        if (plan?.exists && plan.content?.trim()) {
+            parts.push(`Current plan:\n${truncate(plan.content, 4000)}`);
+        }
+    } catch {
+        // Plan is unavailable when the session has no workspace.
+    }
+
+    try {
+        const { rows } = await session.rpc.plan.readSqlTodos();
+        if (rows?.length) {
+            const list = rows
+                .map((r) => `- [${r.status ?? "?"}] ${r.title ?? r.id ?? "(untitled)"}`)
+                .join("\n");
+            parts.push(`Tracked todos:\n${truncate(list, 2000)}`);
+        }
+    } catch {
+        // No session SQL database.
+    }
+
+    return parts.join("\n\n");
+}
+
+function buildPrompt({ transcript, inFlight, planContext }) {
     const extra = cfg("instructions");
+    const planBlock = planContext ? `\n<stated_plan>\n${planContext}\n</stated_plan>\n` : "";
+    const inFlightBlock = inFlight?.length
+        ? `\n<in_flight_right_now>\n${inFlight.join("\n")}\n</in_flight_right_now>\n`
+        : "";
+
     return `You are an ADVISOR. You are watching another AI coding agent work on a user's request. \
 You do NOT do the work yourself and you do NOT talk to the user.
 
 <user_goal>
 ${state.goal || "(not captured — infer it from the transcript)"}
 </user_goal>
-
+${planBlock}
 <recent_activity>
 ${transcript}
 </recent_activity>
-
+${inFlightBlock}${state.verdictHistory.length ? `\n<your_previous_verdicts>\n${state.verdictHistory.join("\n")}\n</your_previous_verdicts>\n` : ""}
 Decide whether the main agent needs an intervention RIGHT NOW.
 
 Intervene for things like:
 - drifting from what the user actually asked for, or silently expanding scope
+- diverging from the stated plan above without saying why
 - acting on an unverified assumption that the transcript shows is probably wrong
 - forgetting an explicit constraint or requirement the user stated
 - repeating an approach that has already failed
 - about to do something destructive, irreversible, or outside the requested scope
 - claiming success without having verified it
 
+If an <in_flight_right_now> block is present, those tool calls are executing as you read this. \
+Weight them heavily: stopping a wrong action there is far more useful than criticising it later.
+
 Do NOT comment on style, formatting, naming, or things the agent is obviously about to do next.
-Do NOT restate what the agent is doing. Silence is the correct answer most of the time.
+Do NOT restate what the agent is doing. Do NOT repeat a previous verdict that was already \
+delivered. Silence is the correct answer most of the time.
 
 You may read files (read/grep/glob) to check a claim. Do not modify anything, and do not run destructive commands.
 
@@ -368,18 +469,26 @@ async function runCheck(session, { force = false } = {}) {
     if (state.checkInFlight) return { skipped: "already running" };
     state.checkInFlight = true;
     state.toolCallsSinceCheck = 0;
-    debug(`check starting (force=${force}, checksRun=${state.checksRun})`);
+    debug(
+        `check starting (force=${force}, checksRun=${state.checksRun},` +
+            ` interval=${currentInterval()}, quietStreak=${state.consecutiveQuietChecks})`,
+    );
 
     try {
-        const transcript = await buildTranscriptDelta(session);
-        if (!transcript) return { skipped: "no new activity" };
+        const snapshot = await buildTranscriptDelta(session);
+        if (!snapshot) return { skipped: "no new activity" };
 
+        const planContext = await readPlanContext(session);
         state.checksRun++;
-        const raw = await runAdvisorAgent(session, buildPrompt(transcript));
+        const raw = await runAdvisorAgent(session, buildPrompt({ ...snapshot, planContext }));
         const advice = parseVerdict(raw);
-        debug(`verdict: ${advice.severity} | raw=${truncate(raw, 300)}`);
+        debug(
+            `verdict: ${advice.severity} | inFlight=${snapshot.inFlight.length}` +
+                ` plan=${planContext ? "yes" : "no"} | raw=${truncate(raw, 300)}`,
+        );
 
         if (advice.severity === "none" || !advice.note) {
+            state.consecutiveQuietChecks++;
             if (force && cfg("logToTimeline")) {
                 await session.log("advisor: no concerns", { ephemeral: true });
             }
@@ -395,6 +504,9 @@ async function runCheck(session, { force = false } = {}) {
 
         state.pendingAdvice = advice;
         state.lastAdviceNote = advice.note;
+        state.consecutiveQuietChecks = 0;
+        state.verdictHistory.push(`[${advice.severity}] ${truncate(advice.note, 200)}`);
+        if (state.verdictHistory.length > VERDICT_HISTORY_LIMIT) state.verdictHistory.shift();
 
         if (cfg("logToTimeline")) {
             const level = advice.severity === "blocker" ? "warning" : "info";
@@ -428,9 +540,12 @@ const session = await joinSession({
             state.toolCallsSinceCheck = 0;
             state.pendingAdvice = null;
             state.lastAdviceNote = "";
+            state.activeCalls.clear();
         },
 
-        onPreToolUse: async () => {
+        onPreToolUse: async (input) => {
+            markCallStarted(input?.toolName, input?.toolArgs);
+
             const advice = takePendingAdvice();
             if (!advice) return;
 
@@ -447,10 +562,12 @@ const session = await joinSession({
         },
 
         onPostToolUse: async (input, invocation) => {
+            markCallFinished(input?.toolName, input?.toolArgs);
             countToolCall(input?.toolName, invocation);
         },
 
         onPostToolUseFailure: async (input, invocation) => {
+            markCallFinished(input?.toolName, input?.toolArgs);
             countToolCall(input?.toolName, invocation);
         },
     },
@@ -463,12 +580,13 @@ const session = await joinSession({
                 const lines = [
                     `enabled:        ${cfg("enabled")}`,
                     `model:          ${cfg("model")} (${cfg("agentType")})`,
-                    `cadence:        every ${cfg("everyNToolCalls")} tool calls (immune for first ${cfg("immuneToolCalls")})`,
+                    `cadence:        every ${cfg("everyNToolCalls")} tool calls (currently ${currentInterval()}, immune for first ${cfg("immuneToolCalls")})`,
                     `block on:       ${cfg("blockOnBlocker") ? "blocker" : "nothing"}`,
                     `config:         ${config._configPath ?? "built-in defaults"}`,
                     `checks run:     ${state.checksRun}`,
                     `advice given:   ${state.adviceDelivered}`,
-                    `tool calls:     ${state.toolCallsSinceCheck}/${cfg("everyNToolCalls")} since last check`,
+                    `tool calls:     ${state.toolCallsSinceCheck}/${currentInterval()} since last check`,
+                    `quiet streak:   ${state.consecutiveQuietChecks}`,
                     `in flight:      ${state.checkInFlight}`,
                     `pending advice: ${state.pendingAdvice ? state.pendingAdvice.severity : "none"}`,
                     `last error:     ${state.lastError ?? "none"}`,
@@ -547,7 +665,7 @@ function countToolCall(toolName, invocation) {
     state.toolCallsSinceCheck++;
 
     if (state.toolCallsThisTurn < cfg("immuneToolCalls")) return;
-    if (state.toolCallsSinceCheck < cfg("everyNToolCalls")) return;
+    if (state.toolCallsSinceCheck < currentInterval()) return;
     if (state.checkInFlight || state.pendingAdvice) return;
 
     // Fire and forget: the main agent must not block on the review.
@@ -555,8 +673,32 @@ function countToolCall(toolName, invocation) {
     void invocation;
 }
 
+// Reviews are expensive and most return nothing, so the interval widens while the agent is
+// behaving and snaps back to the configured cadence as soon as something is worth saying.
+function currentInterval() {
+    const base = cfg("everyNToolCalls");
+    if (!cfg("backoff")) return base;
+
+    const factor = Math.min(2 ** state.consecutiveQuietChecks, cfg("maxBackoffFactor"));
+    return Math.max(base, Math.round(base * factor));
+}
+
 await session.log(
     `advisor ready — ${cfg("model")} every ${cfg("everyNToolCalls")} tool calls` +
         `${config._configPath ? ` (config: ${config._configPath})` : ""}`,
     { ephemeral: true },
 );
+
+// Advice is normally delivered on the next tool call. A turn that ends without one would drop
+// it silently, so surface anything still pending when the session goes idle.
+session.on("session.idle", () => {
+    const advice = state.pendingAdvice;
+    if (!advice) return;
+    state.pendingAdvice = null;
+    debug(`flushing undelivered ${advice.severity} at idle: ${advice.note}`);
+    void session
+        .log(`advisor [${advice.severity}, undelivered]: ${advice.note}`, {
+            level: advice.severity === "blocker" ? "warning" : "info",
+        })
+        .catch(() => {});
+});

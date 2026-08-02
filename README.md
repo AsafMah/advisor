@@ -73,6 +73,8 @@ See `advisor.example.json`. Keys:
 | `agentType`           | `rubber-duck`    | Built-in agent type to spawn.                                            |
 | `everyNToolCalls`     | `12`             | Review cadence.                                                          |
 | `immuneToolCalls`     | `4`              | No reviews until this many tool calls into a turn.                       |
+| `backoff`             | `true`           | Widen the interval after reviews that find nothing.                      |
+| `maxBackoffFactor`    | `8`              | Cap on that widening, as a multiple of `everyNToolCalls`.                 |
 | `blockOnBlocker`      | `true`           | Whether `blocker` denies the tool call, or just injects context.         |
 | `minSeverityToInject` | `nit`            | Drop advice below this severity.                                         |
 | `maxTranscriptChars`  | `24000`          | Cap on the transcript slice sent to the advisor.                         |
@@ -96,6 +98,30 @@ See `advisor.example.json`. Keys:
 
 Session overrides are in-memory and reset when extensions reload.
 
+## What the advisor sees
+
+Each review is given four things:
+
+1. **The user's goal** — the prompt that started the current turn.
+2. **The stated plan** — `plan.md` and the session todo list, read via `rpc.plan.read()` and
+   `rpc.plan.readSqlTodos()`. Without these, "drifting from the request" can only be guessed at.
+3. **Recent activity** — messages, stated intents, tool calls and results since the last review.
+4. **What is executing right now** — tool calls that have started but not finished.
+
+The fourth matters most. It is tracked from the `onPreToolUse` / `onPostToolUse` payloads rather
+than derived from `tool.execution_start` events, because at hook time the corresponding event may
+not have been emitted yet and the derivation would silently yield nothing. Seeing in-flight work
+is what lets a `blocker` stop a wrong action instead of criticising it afterwards.
+
+The advisor is also shown its own recent verdicts, so it can recognise a repeated failure rather
+than restating the same note every review.
+
+## Cadence and backoff
+
+Reviews are expensive and most find nothing, so the interval doubles after each quiet review —
+`everyNToolCalls` → 2× → 4× — capped at `maxBackoffFactor`. Any `nit` or higher resets it to the
+configured cadence immediately. `/advisor` shows the live interval and quiet streak.
+
 ## Design notes
 
 - **Non-blocking.** The review runs as a detached background task; the main agent never waits.
@@ -114,6 +140,9 @@ Session overrides are in-memory and reset when extensions reload.
   and no new review starts while one is in flight or while advice is still pending.
 - **Incremental transcript.** Each review sees only what happened since the previous one, plus
   the user's original goal.
+- **Advice is never silently lost.** Delivery normally happens on the next tool call, but a turn
+  that ends without one would drop it, so anything still pending is flushed to the timeline on
+  `session.idle`.
 - **Self-cleanup.** A sub-agent parks in `idle` forever and would accumulate in the task list,
   so each review's task is cancelled and removed once its reply has been read.
 
@@ -128,6 +157,10 @@ Session overrides are in-memory and reset when extensions reload.
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.
 - Reloading extensions mid-review orphans that review's sub-agent in the `idle` state.
+- Tool results are sent to the advisor model unredacted, so a transcript may carry secrets that
+  appeared in tool output. There is no obfuscation pass yet.
+- The `blocker` deny path and the `session.idle` flush are implemented but have not been observed
+  firing in a real session.
 
 ## Debugging
 

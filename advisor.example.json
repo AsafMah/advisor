@@ -4,6 +4,8 @@
     "agentType": "rubber-duck",
     "everyNToolCalls": 12,
     "immuneToolCalls": 4,
+    "backoff": true,
+    "maxBackoffFactor": 8,
     "blockOnBlocker": true,
     "minSeverityToInject": "nit",
     "maxTranscriptChars": 24000,
