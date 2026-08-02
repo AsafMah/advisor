@@ -6,11 +6,15 @@
 import { joinSession } from "@github/copilot-sdk/extension";
 import { readFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute } from "node:path";
+
+// The CLI's config directory can be relocated, so derive it rather than assuming ~/.copilot.
+const CONFIG_DIR = process.env.COPILOT_CONFIG_DIR || join(homedir(), ".copilot");
+const LOG_DIR = join(CONFIG_DIR, "logs");
 
 const DEFAULTS = {
     enabled: true,
-    model: "gpt-5.6-terra",
+    model: "gpt-5.6-sol",
     agentType: "rubber-duck",
     everyNToolCalls: 12,
     immuneToolCalls: 4,
@@ -28,8 +32,9 @@ const DEFAULTS = {
     // event log but never shown, which is why advice was invisible. The severity is carried in
     // the message text instead. Lower this on a host that renders info.
     timelineLevel: "error",
-    debugLog: join(homedir(), ".copilot", "logs", "advisor.log"),
-    adviceLog: join(homedir(), ".copilot", "logs", "advisor-advice.log"),
+    // Relative paths resolve against the CLI's log directory, so a shared config stays portable.
+    debugLog: "advisor.log",
+    adviceLog: "advisor-advice.log",
     instructions: "",
 };
 
@@ -81,7 +86,7 @@ function loadConfig(workingDirectory) {
     const candidates = [
         process.env.COPILOT_ADVISOR_CONFIG,
         workingDirectory ? join(workingDirectory, ".github", "advisor.json") : undefined,
-        join(homedir(), ".copilot", "advisor.json"),
+        join(CONFIG_DIR, "advisor.json"),
     ].filter(Boolean);
 
     for (const path of candidates) {
@@ -121,15 +126,17 @@ const state = {
 const cfg = (key) => state.sessionOverrides[key] ?? config[key];
 
 // Every session writes to the same configured path, so without a per-session suffix concurrent
-// sessions interleave their entries into one unreadable file.
+// sessions interleave their entries into one unreadable file. A relative path resolves against
+// the CLI's log directory so shared configs carry no machine-specific paths.
 function sessionScopedPath(configuredPath) {
     if (!configuredPath) return null;
-    if (!state.sessionSuffix) return configuredPath;
+    const absolute = isAbsolute(configuredPath) ? configuredPath : join(LOG_DIR, configuredPath);
+    if (!state.sessionSuffix) return absolute;
 
-    const dot = configuredPath.lastIndexOf(".");
-    const slash = Math.max(configuredPath.lastIndexOf("\\"), configuredPath.lastIndexOf("/"));
-    if (dot <= slash) return `${configuredPath}-${state.sessionSuffix}`;
-    return `${configuredPath.slice(0, dot)}-${state.sessionSuffix}${configuredPath.slice(dot)}`;
+    const dot = absolute.lastIndexOf(".");
+    const slash = Math.max(absolute.lastIndexOf("\\"), absolute.lastIndexOf("/"));
+    if (dot <= slash) return `${absolute}-${state.sessionSuffix}`;
+    return `${absolute.slice(0, dot)}-${state.sessionSuffix}${absolute.slice(dot)}`;
 }
 
 function debug(message) {

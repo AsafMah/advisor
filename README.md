@@ -41,48 +41,70 @@ cannot proceed with that action and must react to the note.
 
 ## Install
 
-The extension lives in this repo and is linked into the Copilot CLI extensions directory:
+Ask Copilot to install it directly from a repository folder:
+
+```
+install_extension({ url: "https://github.com/<owner>/<repo>/tree/main/advisor", scope: "user" })
+```
+
+Or place the folder yourself, then run `/extensions reload`:
+
+| Platform | Destination |
+| -------- | ----------- |
+| Windows  | `%USERPROFILE%\.copilot\extensions\advisor\` |
+| macOS / Linux | `~/.copilot/extensions/advisor/` |
+
+Only `extension.mjs` is required. Use `.github/extensions/advisor/` instead to scope it to one
+repository.
+
+For development, link the checkout rather than copying it so edits take effect on reload:
 
 ```powershell
-New-Item -ItemType Junction `
-    -Path "$env:USERPROFILE\.copilot\extensions\advisor" `
-    -Target "G:\copilot-plugins\advisor"
+# Windows
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.copilot\extensions\advisor" -Target "C:\src\advisor"
 ```
 
-Then reload from inside a session:
-
-```
-/extensions reload
+```bash
+# macOS / Linux
+ln -s ~/src/advisor ~/.copilot/extensions/advisor
 ```
 
 ## Configuration
 
-Config is read from the first of these that exists:
+Copy `advisor.example.json` to `~/.copilot/advisor.json` and edit. Config is read from the first
+of these that exists:
 
 1. `$COPILOT_ADVISOR_CONFIG`
-2. `<cwd>/.github/advisor.json`
-3. `~/.copilot/advisor.json`
-4. built-in defaults
+2. `<cwd>/.github/advisor.json` — per-repository
+3. `<copilot config dir>/advisor.json` — per-user
 
-See `advisor.example.json`. Keys:
+Everything is optional; anything omitted falls back to the built-in defaults. Log paths may be
+relative, in which case they resolve against the CLI's log directory.
 
 | Key                   | Default          | Meaning                                                                 |
 | --------------------- | ---------------- | ----------------------------------------------------------------------- |
 | `enabled`             | `true`           | Master switch.                                                          |
-| `model`               | `gpt-5.6-terra`  | Model the advisor runs on. Independent of the main agent's model.        |
-| `agentType`           | `rubber-duck`    | Built-in agent type to spawn.                                            |
+| `model`               | `gpt-5.6-sol`    | Model the advisor runs on. Independent of the main agent's model. Set to `null` to inherit. |
+| `agentType`           | `rubber-duck`    | Built-in agent type to spawn. Custom agents are not dispatchable.         |
 | `everyNToolCalls`     | `12`             | Review cadence.                                                          |
 | `immuneToolCalls`     | `4`              | No reviews until this many tool calls into a turn.                       |
 | `backoff`             | `true`           | Widen the interval after reviews that find nothing.                      |
 | `maxBackoffFactor`    | `8`              | Cap on that widening, as a multiple of `everyNToolCalls`.                 |
+| `maxAdviceAgeMs`      | `120000`         | Discard advice older than this instead of acting on it. `0` disables.    |
 | `blockOnBlocker`      | `true`           | Whether `blocker` denies the tool call, or just injects context.         |
 | `minSeverityToInject` | `nit`            | Drop advice below this severity.                                         |
 | `maxTranscriptChars`  | `24000`          | Cap on the transcript slice sent to the advisor.                         |
 | `maxToolResultChars`  | `1200`           | Per-tool-result truncation inside the transcript.                        |
 | `timeoutMs`           | `180000`         | How long to wait for the advisor sub-agent.                              |
+| `pollIntervalMs`      | `2000`           | How often to check whether the review has finished.                      |
 | `logToTimeline`       | `true`           | Surface advice in the session timeline so you can see it too.            |
-| `debugLog`            | `~/.copilot/logs/advisor.log` | Trace file for the review loop. Set to `null` to disable. |
+| `timelineLevel`       | `"error"`        | Log level for advice. This host renders only `error`; see below.          |
+| `debugLog`            | `"advisor.log"`  | Trace file for the review loop. Relative to the CLI log directory. `null` disables. |
+| `adviceLog`           | `"advisor-advice.log"` | Human-readable advice record read by `/advisor-log`. `null` disables. |
 | `instructions`        | `""`             | Extra project-specific review instructions appended to the prompt.       |
+
+Log paths are suffixed with the session id, so `advisor-advice.log` becomes
+`advisor-advice-1a2b3c4d.log`.
 
 ## Commands
 
