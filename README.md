@@ -184,6 +184,10 @@ their entries into a single unreadable file.
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.
 - Reloading extensions mid-review orphans that review's sub-agent in the `idle` state.
+- Some sessions have no agent executors at all (`Cannot start subagent: agent executors are not
+  available for this session`). There is no capability flag to detect this up front, so the
+  advisor discovers it on its first review, disables itself for that session and says so.
+  `/advisor-on` re-enables it.
 - The `session.idle` flush is implemented but has not been observed firing in a real session.
 
 ## Debugging

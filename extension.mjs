@@ -51,6 +51,18 @@ const BUILTIN_AGENT_TYPES = [
     "security-review",
 ];
 
+// Failures that will recur identically on every future review. Retrying them wastes a sub-agent
+// dispatch per cadence interval and repeats the same error, so the advisor stands itself down.
+const FATAL_ERROR_PATTERNS = [
+    /agent executors are not available/i,
+    /unknown agent type/i,
+    /startAgent unavailable/i,
+];
+
+function isFatalError(message) {
+    return FATAL_ERROR_PATTERNS.some((pattern) => pattern.test(message ?? ""));
+}
+
 // Separates advice entries in the log. A visible marker is unsafe: advice text may itself contain
 // a markdown heading at line start. U+001E (record separator) is guaranteed absent from notes
 // because `sanitizeNote` strips that control range, and it renders as nothing in a text viewer,
@@ -377,7 +389,7 @@ async function runAdvisorAgent(session, prompt) {
     const agentType = cfg("agentType");
     if (!BUILTIN_AGENT_TYPES.includes(agentType)) {
         throw new Error(
-            `agentType "${agentType}" is not a built-in agent. startAgent accepts only: ` +
+            `Unknown agent type: ${agentType}. startAgent accepts only: ` +
                 `${BUILTIN_AGENT_TYPES.join(", ")}. Custom agents cannot be dispatched this way.`,
         );
     }
@@ -609,9 +621,17 @@ async function runCheck(session, { force = false } = {}) {
 
         // A misconfigured advisor would otherwise fail every review in silence, visible only in
         // the debug log. Surface each distinct failure once so it cannot go unnoticed.
-        if (cfg("logToTimeline") && (force || state.lastError !== state.lastReportedError)) {
+        if (isFatalError(state.lastError)) {
+            state.sessionOverrides.enabled = false;
             state.lastReportedError = state.lastError;
-            await session.log(`advisor error: ${state.lastError}`, { level: "error" });
+            await report(
+                `advisor disabled for this session — reviews cannot run here.\n` +
+                    `${state.lastError}\n` +
+                    `Re-enable with /advisor-on once the cause is resolved.`,
+            );
+        } else if (cfg("logToTimeline") && (force || state.lastError !== state.lastReportedError)) {
+            state.lastReportedError = state.lastError;
+            await report(`advisor error: ${state.lastError}`);
         }
         return { error: state.lastError };
     } finally {
@@ -717,6 +737,7 @@ const session = await joinSession({
             description: "Enable the advisor for this session",
             handler: async () => {
                 state.sessionOverrides.enabled = true;
+                state.lastReportedError = null;
                 await report("advisor: enabled");
             },
         },
