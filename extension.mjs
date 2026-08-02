@@ -24,7 +24,12 @@ const DEFAULTS = {
     timeoutMs: 180000,
     pollIntervalMs: 2000,
     logToTimeline: true,
+    // Only error-level logs are rendered by the app host; info and warning are persisted to the
+    // event log but never shown, which is why advice was invisible. The severity is carried in
+    // the message text instead. Lower this on a host that renders info.
+    timelineLevel: "error",
     debugLog: join(homedir(), ".copilot", "logs", "advisor.log"),
+    adviceLog: join(homedir(), ".copilot", "logs", "advisor-advice.log"),
     instructions: "",
 };
 
@@ -103,6 +108,21 @@ function debug(message) {
         appendFileSync(path, `${new Date().toISOString()} ${message}\n`);
     } catch {
         // Logging must never break the review loop.
+    }
+}
+
+// Advice is delivered into the main agent's context, where the user cannot see it. This is the
+// human-readable record of what the advisor actually said — tail it to watch reviews live:
+//   Get-Content ~\.copilot\logs\advisor-advice.log -Wait
+function recordAdvice(severity, note, outcome) {
+    const path = cfg("adviceLog");
+    if (!path) return;
+    const stamp = new Date().toLocaleTimeString();
+    const entry = `\n[${stamp}] ${severity.toUpperCase()} (${outcome})\n${note}\n`;
+    try {
+        appendFileSync(path, entry);
+    } catch {
+        // Never break the review loop over logging.
     }
 }
 
@@ -324,6 +344,13 @@ The above is from an independent reviewer model watching your work. It cannot se
 context and may be wrong — weigh it against what you know. If it is wrong, say so briefly and continue.`;
 }
 
+// Only error-level logs render, and they render quietly, so the message itself has to carry the
+// emphasis. The banner makes advice findable when scrolling back through a long session.
+function formatTimelineAdvice(advice, suffix = "") {
+    const bar = "━".repeat(18);
+    return `${bar} ⚠  ADVISOR · ${advice.severity.toUpperCase()}${suffix} ${bar}\n${advice.note}`;
+}
+
 async function runAdvisorAgent(session, prompt) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
@@ -533,7 +560,7 @@ async function runCheck(session, { force = false } = {}) {
         if (advice.severity === "none" || !advice.note) {
             state.consecutiveQuietChecks++;
             if (force && cfg("logToTimeline")) {
-                await session.log("advisor: no concerns", { ephemeral: true });
+                await session.log("advisor: no concerns", { level: cfg("timelineLevel") });
             }
             return { severity: "none" };
         }
@@ -553,9 +580,9 @@ async function runCheck(session, { force = false } = {}) {
         if (state.verdictHistory.length > VERDICT_HISTORY_LIMIT) state.verdictHistory.shift();
 
         if (cfg("logToTimeline")) {
-            const level = advice.severity === "blocker" ? "warning" : "info";
-            await session.log(`advisor [${advice.severity}]: ${advice.note}`, { level });
+            await session.log(formatTimelineAdvice(advice), { level: cfg("timelineLevel") });
         }
+        recordAdvice(advice.severity, advice.note, "raised");
         return advice;
     } catch (err) {
         state.lastError = err?.message ?? String(err);
@@ -585,6 +612,7 @@ function takePendingAdvice() {
     const maxAge = cfg("maxAdviceAgeMs");
     if (maxAge && age > maxAge) {
         debug(`dropping stale ${advice.severity} advice (${Math.round(age / 1000)}s old)`);
+        recordAdvice(advice.severity, advice.note, `dropped, ${Math.round(age / 1000)}s stale`);
         return null;
     }
 
@@ -611,6 +639,7 @@ const session = await joinSession({
 
             if (advice.severity === "blocker" && cfg("blockOnBlocker")) {
                 debug(`delivering BLOCKER (denying tool call): ${advice.note}`);
+                recordAdvice(advice.severity, advice.note, `DENIED tool call: ${input?.toolName}`);
                 return {
                     permissionDecision: "deny",
                     permissionDecisionReason: `Advisor blocker: ${advice.note}`,
@@ -618,6 +647,7 @@ const session = await joinSession({
                 };
             }
             debug(`delivering ${advice.severity} as context: ${advice.note}`);
+            recordAdvice(advice.severity, advice.note, `injected before: ${input?.toolName}`);
             return { additionalContext: formatAdvice(advice) };
         },
 
@@ -744,10 +774,28 @@ function currentInterval() {
 }
 
 await session.log(
-    `advisor ready — ${cfg("model")} every ${cfg("everyNToolCalls")} tool calls` +
+    `advisor ready — ${cfg("model") ?? "agent default"} every ${cfg("everyNToolCalls")} tool calls` +
         `${config._configPath ? ` (config: ${config._configPath})` : ""}`,
     { ephemeral: true },
 );
+
+// Diagnostic for working out which log variants the host actually renders. Advice was emitted
+// with `level` and no `ephemeral` flag and never appeared, while the ephemeral startup line did,
+// so the two differ in a way that matters. Enable `surfaceTest` and reload to see which reach
+// the UI.
+if (cfg("surfaceTest")) {
+    const variants = [
+        ["SURFACE 1 — ephemeral, no level", { ephemeral: true }],
+        ["SURFACE 2 — level info, persisted", { level: "info" }],
+        ["SURFACE 3 — level info, ephemeral", { level: "info", ephemeral: true }],
+        ["SURFACE 4 — level warning, persisted", { level: "warning" }],
+        ["SURFACE 5 — level error, persisted", { level: "error" }],
+        ["SURFACE 6 — no options at all", undefined],
+    ];
+    for (const [message, options] of variants) {
+        await session.log(message, options).catch(() => {});
+    }
+}
 
 // Advice is normally delivered on the next tool call. A turn that ends without one would drop
 // it silently, so surface anything still pending when the session goes idle.
@@ -756,9 +804,8 @@ session.on("session.idle", () => {
     if (!advice) return;
     state.pendingAdvice = null;
     debug(`flushing undelivered ${advice.severity} at idle: ${advice.note}`);
+    recordAdvice(advice.severity, advice.note, "undelivered, turn ended");
     void session
-        .log(`advisor [${advice.severity}, undelivered]: ${advice.note}`, {
-            level: advice.severity === "blocker" ? "warning" : "info",
-        })
+        .log(formatTimelineAdvice(advice, " · UNDELIVERED"), { level: cfg("timelineLevel") })
         .catch(() => {});
 });
