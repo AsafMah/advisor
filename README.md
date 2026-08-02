@@ -1,10 +1,36 @@
 # advisor
 
-An independent reviewer model that watches the main Copilot agent work and intervenes when it
-drifts, forgets a requirement, or is about to do something wrong.
+An independent reviewer model that watches the main Copilot agent work and comments when it
+drifts, forgets a requirement, or repeats an approach that has already failed.
+
+Review is **asynchronous and retrospective**: it audits what has happened, it does not gate what
+happens next. Read "What a blocker actually does" before relying on it as a safety control.
 
 Inspired by [oh-my-pi](https://github.com/)'s `WATCHDOG` advisor, reimplemented as a GitHub
 Copilot CLI extension.
+
+## Status: experimental
+
+The mechanism works and is well tested. Whether continuous review is *worth its cost* is not
+established. From ~50 review runs in one long session:
+
+| Verdict | Count |
+| ------- | ----- |
+| `none` | 36 |
+| `concern` | 3 |
+| `nit` | 1 |
+| `blocker` | 4 — all synthetic, forced during testing |
+| errors | 8 |
+
+**No blocker has ever fired organically.** Two catches were genuinely valuable — a real defect in
+this extension's own code, and catching its author building a workaround before diagnosing a root
+cause — which is roughly 25 frontier-model reviews per useful catch.
+
+Both came while reviewing work on *this extension*: long, tool-heavy, plan-explicit engineering.
+That is plausibly where the value is, and it is narrower than "watch everything". Routine work
+produces mostly expensive silence. Budget accordingly, and prefer a higher `everyNToolCalls` or
+manual `/advisor-check` over the default cadence until you have your own evidence.
+
 
 ## How it works
 
@@ -22,8 +48,11 @@ main agent runs tools
         └─ onPreToolUse ◄──────── pending advice ◄───────────────┘
                 │
                 ├─ nit / concern ─► injected as hidden context
-                └─ blocker ───────► tool call DENIED with the advisor's reason
+                └─ blocker ───────► the NEXT tool call is denied
 ```
+
+Note the asymmetry in that diagram: the review is triggered by one tool call but delivered
+before a *later* one. Everything below follows from that.
 
 Every `everyNToolCalls` tool calls, the extension snapshots what has happened since the last
 review and hands it to a **separate sub-agent** running its own model. That agent returns a
@@ -32,12 +61,28 @@ severity and a note. The advice is then delivered on the main agent's *next* too
 | Severity  | Effect                                                            |
 | --------- | ----------------------------------------------------------------- |
 | `none`    | Nothing happens.                                                  |
-| `nit`     | Injected as hidden context alongside the tool call.               |
+| `nit`     | Injected as hidden context alongside the next tool call.          |
 | `concern` | Injected as hidden context.                                       |
-| `blocker` | The tool call is **denied**, with the advisor's note as the reason. |
+| `blocker` | The next tool call is **denied**, with the advisor's note as the reason. |
 
-Denying is this runtime's closest equivalent to oh-my-pi's steering channel: the main agent
-cannot proceed with that action and must react to the note.
+## What a blocker actually does
+
+A blocker denies **the next tool call the agent makes**, which is usually *not* the call the
+reviewer was looking at. By the time a verdict arrives — reviews take 10–60 seconds while the
+agent keeps working — the action under review has typically finished.
+
+So a blocker is a loud, disruptive way to make the agent stop and read a note. It is not a gate:
+
+- It may deny an unrelated, harmless call.
+- It cannot cancel work already in flight; `onPreToolUse` has already passed for those.
+- The agent may simply retry, route around it, or answer without calling a tool at all.
+- Nothing is latched — one call is denied, then normal operation resumes.
+
+Advice older than `maxAdviceAgeMs` is discarded rather than delivered, which limits the damage
+but does not make delivery causally aligned with the reviewed action.
+
+Treat `blockOnBlocker` as "interrupt me hard", not as a safety control. If you want advice
+without the disruption, set it to `false` and blockers inject as context like everything else.
 
 ## Install
 
@@ -133,8 +178,9 @@ Each review is given four things:
 
 The fourth matters most. It is tracked from the `onPreToolUse` / `onPostToolUse` payloads rather
 than derived from `tool.execution_start` events, because at hook time the corresponding event may
-not have been emitted yet and the derivation would silently yield nothing. Seeing in-flight work
-is what lets a `blocker` stop a wrong action instead of criticising it afterwards.
+not have been emitted yet and the derivation would silently yield nothing. Knowing what is
+running tells the reviewer what the agent is committed to, which a purely historical transcript
+does not. It does **not** let the advisor stop that call — see "What a blocker actually does".
 
 The advisor is also shown its own recent verdicts, so it can recognise a repeated failure rather
 than restating the same note every review.
@@ -176,12 +222,18 @@ discarded as "no concerns".
 
 - **Non-blocking.** The review runs as a detached background task; the main agent never waits.
   Advice lands on the next tool call after the advisor finishes.
-- **Reply recovery.** `tasks.list()` reports the sub-agent as `idle` but leaves `result` null
-  permanently, and the `toolCallId` it reports for an RPC-started agent is a stub (the agent
-  name), not a real tool call id. The reply is therefore recovered from the session event log:
-  the extension records the event count before starting, finds the `subagent.started` event
-  after that baseline, and reads the last `assistant.message` carrying the same internal
-  `agentId` (`bg-…`) once `subagent.completed` appears.
+- **Reply recovery.** The reply is read in order of reliability: `task.result`, then
+  `task.latestResponse`, then the session event log. The first two are keyed by the task id the
+  extension owns, so they cannot bind to a foreign agent. The event-log fallback exists because
+  `tasks.list()` can report the sub-agent as `idle` while leaving `result` null indefinitely; it
+  records the event count before dispatching, finds the `subagent.started` event carrying this
+  extension's own description, and reads the last `assistant.message` with the same internal
+  `agentId` (`bg-…`) once `subagent.completed` appears. Correlation requires an exact match —
+  guessing by model or by "first agent after my baseline" will eventually bind to another
+  extension's sub-agent and parse its output as a verdict.
+- **The advisor is excluded from its own transcript.** Sub-agent events carry an `agentId`;
+  main-agent events do not. Without that filter the advisor reads its own previous verdict and
+  its own file reads as things the main agent said and did.
 - **Untrusted output.** The advisor's note is injected into the main agent's context and can deny
   a tool call, so it is stripped of control characters, has angle brackets escaped so it cannot
   forge a structural tag, and is capped at 800 characters. It is wrapped in an `<advisor>` block
@@ -190,8 +242,9 @@ discarded as "no concerns".
   verdict, because an empty verdict reads as "no concerns" — which both hides the failure and,
   by counting as a quiet review, widens the backoff so reviews become rarer. Errors surface once
   per distinct message; failures that cannot succeed on retry disable the advisor and say so.
-- **Emission guard.** One piece of advice per review, identical consecutive notes are dropped,
-  and no new review starts while one is in flight or while advice is still pending.
+- **Emission guard.** One piece of advice per review; no new review starts while one is in flight
+  or while advice is still pending. Identical advice is suppressed for five minutes, but never
+  for a `blocker`, so a genuine repeat of the same mistake is not silenced.
 - **Incremental transcript.** Each review sees only what happened since the previous one, plus
   the user's original goal.
 - **Advice is never silently lost.** Delivery normally happens on the next tool call, but a turn
@@ -208,6 +261,12 @@ discarded as "no concerns".
 
 ## Known limitations
 
+- **Review is retrospective, not preventive.** Reviews take 10–60 seconds while the agent keeps
+  working, and advice is delivered at the next tool-call boundary. The action under review has
+  usually finished by then. See "What a blocker actually does".
+- **Cadence is a poor proxy for risk.** Triggering every N tool calls means most reviews land on
+  routine work and return nothing, while a genuinely risky action gets no more scrutiny than a
+  file read. Deterministic risk signals would be a better trigger; this does not implement them.
 - **Reasoning effort cannot be controlled.** `startAgent` takes a `model` but no effort
   parameter, and it accepts only built-in agent types — `explore`, `task`, `general-purpose`,
   `rubber-duck`, `code-review`, `research`, `security-review`. A custom agent on disk can carry
@@ -219,8 +278,7 @@ discarded as "no concerns".
   agent you dispatch yourself.
 - Every review emits an "agent finished" system notification into the main agent's context.
   This is runtime behaviour for background agents and cannot currently be suppressed.
-- Advice cannot interrupt mid-stream — it is delivered at the next tool-call boundary. An agent
-  that stops calling tools and answers directly will not be reviewed before it replies.
+- An agent that stops calling tools and answers directly will not be reviewed before it replies.
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.
 - Reloading extensions mid-review orphans that review's sub-agent in the `idle` state.
