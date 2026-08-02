@@ -16,6 +16,7 @@ const DEFAULTS = {
     immuneToolCalls: 4,
     backoff: true,
     maxBackoffFactor: 8,
+    maxAdviceAgeMs: 120000,
     blockOnBlocker: true,
     minSeverityToInject: "nit",
     maxTranscriptChars: 24000,
@@ -32,6 +33,18 @@ const SEVERITY_RANK = { none: 0, nit: 1, concern: 2, blocker: 3 };
 // How many consecutive settled-but-empty polls to tolerate before giving up, to absorb the lag
 // between a sub-agent reporting "idle" and its reply becoming readable.
 const SETTLED_EMPTY_POLL_LIMIT = 8;
+
+// `tasks.startAgent` accepts only these built-in agent types. Custom agents defined on disk are
+// not dispatchable through it, so the advisor cannot use one to pin its own reasoning effort.
+const BUILTIN_AGENT_TYPES = [
+    "explore",
+    "task",
+    "general-purpose",
+    "rubber-duck",
+    "code-review",
+    "research",
+    "security-review",
+];
 
 // Distinctive description stamped on the sub-agent so its events can be identified in the
 // session event log. RPC-started agents have no parent tool call to correlate on.
@@ -69,6 +82,7 @@ const state = {
     lastEventIndex: 0,
     checkInFlight: false,
     pendingAdvice: null,
+    pendingAdviceAt: 0,
     lastAdviceNote: "",
     verdictHistory: [],
     consecutiveQuietChecks: 0,
@@ -76,6 +90,7 @@ const state = {
     checksRun: 0,
     adviceDelivered: 0,
     lastError: null,
+    lastReportedError: null,
     sessionOverrides: {},
 };
 
@@ -313,6 +328,14 @@ async function runAdvisorAgent(session, prompt) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
 
+    const agentType = cfg("agentType");
+    if (!BUILTIN_AGENT_TYPES.includes(agentType)) {
+        throw new Error(
+            `agentType "${agentType}" is not a built-in agent. startAgent accepts only: ` +
+                `${BUILTIN_AGENT_TYPES.join(", ")}. Custom agents cannot be dispatched this way.`,
+        );
+    }
+
     let baseline = 0;
     try {
         baseline = (await session.getEvents()).length;
@@ -320,14 +343,21 @@ async function runAdvisorAgent(session, prompt) {
         baseline = 0;
     }
 
+    // When `model` is unset the agent definition's own model and reasoning effort apply. The
+    // startAgent RPC has no effort parameter, so a dedicated custom agent is the only way to
+    // pin the advisor's reasoning level.
+    const modelOverride = cfg("model");
     const { agentId } = await rpc.tasks.startAgent({
         agentType: cfg("agentType"),
         prompt,
         name: "advisor",
         description: ADVISOR_TASK_DESCRIPTION,
-        model: cfg("model"),
+        ...(modelOverride ? { model: modelOverride } : {}),
     });
-    debug(`started advisor agent ${agentId} on ${cfg("model")} (event baseline ${baseline})`);
+    debug(
+        `started advisor agent ${agentId} as ${cfg("agentType")}` +
+            ` on ${modelOverride ?? "agent-defined model"} (event baseline ${baseline})`,
+    );
 
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
@@ -358,13 +388,26 @@ async function runAdvisorAgent(session, prompt) {
 
             if (task.status === "failed") throw new Error(task.error || "advisor agent failed");
             if (task.status === "cancelled") return "";
-            if (task.result) return task.result;
+
+            // Exact correlation: keyed by the task id we own, so unlike event-log matching these
+            // cannot pick up the self-learn extension's or the main agent's sub-agent.
+            if (task.result) {
+                debug(`reply via task.result`);
+                return task.result;
+            }
+            if (task.latestResponse) {
+                debug(`reply via task.latestResponse`);
+                return task.latestResponse;
+            }
 
             // The task parks in "idle" without ever exposing a result, so the event log is the
             // real completion signal.
             const { status, reply } = await readAgentReplyFromEventLog(session, task.toolCallId, baseline);
             if (status === "failed") throw new Error(reply);
-            if (status === "done") return reply;
+            if (status === "done") {
+                debug(`reply via event log (fallback)`);
+                return reply;
+            }
 
             // Guard against a sub-agent that settles without ever emitting a completion event.
             if (task.status === "completed" || task.status === "idle") {
@@ -503,6 +546,7 @@ async function runCheck(session, { force = false } = {}) {
         }
 
         state.pendingAdvice = advice;
+        state.pendingAdviceAt = Date.now();
         state.lastAdviceNote = advice.note;
         state.consecutiveQuietChecks = 0;
         state.verdictHistory.push(`[${advice.severity}] ${truncate(advice.note, 200)}`);
@@ -516,7 +560,11 @@ async function runCheck(session, { force = false } = {}) {
     } catch (err) {
         state.lastError = err?.message ?? String(err);
         debug(`ERROR: ${state.lastError}`);
-        if (force && cfg("logToTimeline")) {
+
+        // A misconfigured advisor would otherwise fail every review in silence, visible only in
+        // the debug log. Surface each distinct failure once so it cannot go unnoticed.
+        if (cfg("logToTimeline") && (force || state.lastError !== state.lastReportedError)) {
+            state.lastReportedError = state.lastError;
             await session.log(`advisor error: ${state.lastError}`, { level: "error" });
         }
         return { error: state.lastError };
@@ -528,7 +576,19 @@ async function runCheck(session, { force = false } = {}) {
 function takePendingAdvice() {
     const advice = state.pendingAdvice;
     state.pendingAdvice = null;
-    if (advice) state.adviceDelivered++;
+    if (!advice) return null;
+
+    // A review runs asynchronously, so its verdict can arrive after the situation that prompted
+    // it has already moved on. Acting on stale advice — especially denying a tool call over it —
+    // is worse than dropping it.
+    const age = Date.now() - state.pendingAdviceAt;
+    const maxAge = cfg("maxAdviceAgeMs");
+    if (maxAge && age > maxAge) {
+        debug(`dropping stale ${advice.severity} advice (${Math.round(age / 1000)}s old)`);
+        return null;
+    }
+
+    state.adviceDelivered++;
     return advice;
 }
 
