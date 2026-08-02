@@ -1,0 +1,7 @@
+# Local advisor config (may contain project-specific instructions)
+advisor.json
+
+# Logs
+*.log
+
+node_modules/

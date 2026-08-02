@@ -1,0 +1,15 @@
+{
+    "enabled": true,
+    "model": "gpt-5.6-terra",
+    "agentType": "rubber-duck",
+    "everyNToolCalls": 12,
+    "immuneToolCalls": 4,
+    "blockOnBlocker": true,
+    "minSeverityToInject": "nit",
+    "maxTranscriptChars": 24000,
+    "maxToolResultChars": 1200,
+    "timeoutMs": 180000,
+    "pollIntervalMs": 2000,
+    "logToTimeline": true,
+    "instructions": ""
+}
