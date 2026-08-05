@@ -37,15 +37,16 @@ manual `/advisor-check` over the default cadence until you have your own evidenc
 ```
 main agent runs tools
         │
-        ├─ onPostToolUse ──► counter++
-        │                       │
-        │                       └─ every N tool calls ─► spawn advisor sub-agent
-        │                                                 (own model, own context)
-        │                                                        │
-        │                                                        ▼
-        │                                            {"severity":…, "note":…}
-        │                                                        │
-        └─ onPreToolUse ◄──────── pending advice ◄───────────────┘
+        ├─ tool.execution_start ──► counter++
+        │       (main agent only)     │
+        │                             └─ every N tool calls ─► spawn advisor sub-agent
+        │                                                       (own model, own context)
+        │                                                              │
+        │                                                              ▼
+        │                                                  {"severity":…, "note":…}
+        │                                                              │
+        └─ onPreToolUse ◄──────── pending advice ◄─────────────────────┘
+           (main agent only)
                 │
                 ├─ nit / concern ─► injected as hidden context
                 └─ blocker ───────► the NEXT tool call is denied
@@ -176,11 +177,10 @@ Each review is given four things:
 3. **Recent activity** — messages, stated intents, tool calls and results since the last review.
 4. **What is executing right now** — tool calls that have started but not finished.
 
-The fourth matters most. It is tracked from the `onPreToolUse` / `onPostToolUse` payloads rather
-than derived from `tool.execution_start` events, because at hook time the corresponding event may
-not have been emitted yet and the derivation would silently yield nothing. Knowing what is
-running tells the reviewer what the agent is committed to, which a purely historical transcript
-does not. It does **not** let the advisor stop that call — see "What a blocker actually does".
+The fourth matters most. It is derived from `tool.execution_start` / `tool.execution_complete`
+events for the main agent, keyed by call id. Knowing what is running tells the reviewer what the
+agent is committed to, which a purely historical transcript does not. It does **not** let the
+advisor stop that call — see "What a blocker actually does".
 
 The advisor is also shown its own recent verdicts, so it can recognise a repeated failure rather
 than restating the same note every review.
@@ -229,6 +229,14 @@ Three layers guard against it:
 Note the asymmetry this corrects: the advisor's *output* was already quarantined (angle brackets
 escaped, length capped), but nothing filtered its *input*.
 
+Layer 3 depends on the record of user prompts being genuinely the user's. It was not: a sub-agent's
+opening prompt is dispatched to `onUserPromptSubmitted` like any other, so every `task` sub-agent's
+brief — and the advisor's own review prompt, which embeds the whole transcript — was being recorded
+as something the user had said. That both replaced the goal under review and let arbitrary
+transcript text corroborate a blocker claiming to quote the user. Observed in the wild: the advisor
+denied a main-agent tool call over a "user requirement" that was a sub-agent's task prompt. Hooks
+are now attributed to an agent before they are acted on — see "Only the main agent is watched".
+
 ## Development
 
 ```
@@ -256,9 +264,16 @@ discarded as "no concerns".
   `agentId` (`bg-…`) once `subagent.completed` appears. Correlation requires an exact match —
   guessing by model or by "first agent after my baseline" will eventually bind to another
   extension's sub-agent and parse its output as a verdict.
-- **The advisor is excluded from its own transcript.** Sub-agent events carry an `agentId`;
-  main-agent events do not. Without that filter the advisor reads its own previous verdict and
-  its own file reads as things the main agent said and did.
+- **Only the main agent is watched.** Sub-agent events carry an `agentId`; main-agent events do
+  not. Every trigger path filters on it: the transcript, the in-flight set, and the tool-call
+  counter that drives the cadence. Extension hooks need more work, because they are dispatched for
+  sub-agents too and their payload carries no agent identity — the `invocation` argument holds
+  only `sessionId`. The event log brackets each hook dispatch in `hook.start`/`hook.end` events
+  that *do* carry `agentId`, so `onUserPromptSubmitted` and `onPreToolUse` resolve their caller
+  from the bracket open around them. Without this the advisor reads its own review prompt as the
+  user's goal, counts its own file reads as the main agent working, and delivers advice about the
+  main agent into a sub-agent that cannot act on it. None of this stands the advisor down while a
+  sub-agent runs: advice stays pending and is delivered on the main agent's next tool call.
 - **Untrusted output.** The advisor's note is injected into the main agent's context and can deny
   a tool call, so it is stripped of control characters, has angle brackets escaped so it cannot
   forge a structural tag, and is capped at 800 characters. It is wrapped in an `<advisor>` block

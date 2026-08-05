@@ -300,37 +300,26 @@ function renderEvent(event) {
 // Tool calls that have started but not finished — what the agent is doing right now. Without
 // these the advisor only ever sees the past and can react to a mistake but never prevent one.
 //
-// These are tracked from the hook payloads rather than derived from `tool.execution_start`
-// events, because at hook time the corresponding event may not have been emitted yet and the
-// derivation would silently yield nothing. The hooks carry `toolName`/`toolArgs` authoritatively.
-// Hook payloads have no call id, so identical concurrent calls are counted rather than keyed.
+// Derived from the event log rather than from the tool-use hooks, because those hooks fire for
+// sub-agent tool calls as well and carry no agent identity — the advisor's own review agent's
+// file reads would otherwise be shown to the next review as the main agent's work in progress.
+// The events are keyed by a real call id, and `tool.execution_start` reaches the extension before
+// the pre-tool-use hook does, so tracking them loses no immediacy.
 const MAX_ACTIVE_CALL_AGE_MS = 10 * 60 * 1000;
 
-function callKey(toolName, toolArgs) {
-    return `${toolName}\u0000${truncate(toolArgs, 400)}`;
+function noteCallStarted(event) {
+    const { toolCallId, toolName, arguments: toolArgs } = event?.data ?? {};
+    if (event?.agentId || !toolCallId || !toolName) return;
+    state.activeCalls.set(toolCallId, { toolName, toolArgs, startedAt: Date.now() });
 }
 
-function markCallStarted(toolName, toolArgs) {
-    if (!toolName) return;
-    const key = callKey(toolName, toolArgs);
-    const entry = state.activeCalls.get(key);
-    if (entry) {
-        entry.count++;
-        entry.startedAt = Date.now();
-    } else {
-        state.activeCalls.set(key, { toolName, toolArgs, count: 1, startedAt: Date.now() });
-    }
+function noteCallFinished(event) {
+    const id = event?.data?.toolCallId;
+    if (id) state.activeCalls.delete(id);
 }
 
-function markCallFinished(toolName, toolArgs) {
-    if (!toolName) return;
-    const key = callKey(toolName, toolArgs);
-    const entry = state.activeCalls.get(key);
-    if (!entry) return;
-    if (--entry.count <= 0) state.activeCalls.delete(key);
-}
-
-// A tool call that is aborted never reaches a post hook, so its entry would leak.
+// A tool call abandoned without a completion event would leak. A call denied by the pre-tool-use
+// hook is not such a case — it still completes, so a blocked call clears itself.
 function pruneActiveCalls() {
     const cutoff = Date.now() - MAX_ACTIVE_CALL_AGE_MS;
     for (const [key, entry] of state.activeCalls) {
@@ -341,8 +330,55 @@ function pruneActiveCalls() {
 function collectInFlight() {
     pruneActiveCalls();
     return [...state.activeCalls.values()].map(
-        (e) => `${e.toolName}${e.count > 1 ? ` (x${e.count})` : ""}: ${renderToolArgs(e.toolArgs)}`,
+        (e) => `${e.toolName}: ${renderToolArgs(e.toolArgs)}`,
     );
+}
+
+// Hooks are dispatched for sub-agents as well as for the main agent: a `task` sub-agent's tool
+// calls reach the tool-use hooks, and its opening prompt reaches `onUserPromptSubmitted`. So does
+// the advisor's own review agent's prompt. The hook payload carries no agent identity — its
+// `invocation` argument holds only `sessionId` — so a handler cannot tell on its own.
+//
+// The session event log brackets every hook dispatch in `hook.start`/`hook.end` events that do
+// carry `agentId`, correlated by `hookInvocationId`. `hook.start` reaches the extension before
+// the handler runs and `hook.end` only after it returns, so a handler can ask which agent it is
+// running for by looking at the bracket that is open around it.
+const HOOK_USER_PROMPT_SUBMITTED = "userPromptSubmitted";
+const HOOK_PRE_TOOL_USE = "preToolUse";
+
+// A bracket whose end is somehow never seen would otherwise sit open forever.
+const MAX_OPEN_HOOK_DISPATCHES = 64;
+const openHookDispatches = new Map();
+
+function noteHookStart(event) {
+    const { hookInvocationId, hookType, input } = event?.data ?? {};
+    if (!hookInvocationId || !hookType) return;
+    openHookDispatches.set(hookInvocationId, { hookType, agentId: event?.agentId, input });
+    // A Map iterates in insertion order, so the first key is the oldest.
+    if (openHookDispatches.size > MAX_OPEN_HOOK_DISPATCHES) {
+        openHookDispatches.delete(openHookDispatches.keys().next().value);
+    }
+}
+
+function noteHookEnd(event) {
+    const id = event?.data?.hookInvocationId;
+    if (id) openHookDispatches.delete(id);
+}
+
+// `matches` narrows the open dispatches by payload, because the main agent and a sub-agent can be
+// inside the same hook type at the same moment. Deliberately fails open: an unattributable
+// dispatch is treated as the main agent's, so a missing bracket costs no more than today's
+// behaviour rather than silencing the advisor outright.
+async function hookIsForSubAgent(hookType, matches) {
+    // The bracket is emitted before the handler is called but arrives over the same channel, so
+    // yielding once lets the listener record it first. That makes the lookup ordered rather than
+    // dependent on delivery having already happened.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const open = [...openHookDispatches.values()].filter((d) => d.hookType === hookType);
+    const matched = open.filter((d) => matches(d.input));
+    const candidates = matched.length ? matched : open;
+    return candidates.length > 0 && candidates.every((d) => d.agentId);
 }
 
 async function buildTranscriptDelta(session) {
@@ -884,6 +920,21 @@ function takePendingAdvice() {
 const session = await joinSession({
     hooks: {
         onUserPromptSubmitted: async (input) => {
+            // A sub-agent's opening prompt is dispatched here too, the advisor's own review
+            // prompt included. Adopting one as the user's goal is not merely noisy: `userPrompts`
+            // is the trusted record `downgradeUnfoundedUserClaim` corroborates against, so a
+            // sub-agent prompt landing there lets text the advisor only read back to itself pass
+            // as the user's own words. Observed: the advisor denied a main-agent tool call over a
+            // "user requirement" that was in fact a sub-agent's task prompt.
+            const forSubAgent = await hookIsForSubAgent(
+                HOOK_USER_PROMPT_SUBMITTED,
+                (i) => i?.prompt === input?.prompt,
+            );
+            if (forSubAgent) {
+                debug(`ignoring sub-agent prompt: ${truncate(input?.prompt ?? "", 120)}`);
+                return;
+            }
+
             state.goal = input.prompt ?? "";
             // Kept across turns: this is the only trusted record of what the user actually asked
             // for, and a later "continue" must not erase an earlier requirement.
@@ -899,16 +950,28 @@ const session = await joinSession({
         },
 
         onPreToolUse: async (input) => {
-            markCallStarted(input?.toolName, input?.toolArgs);
+            // Sub-agent tool calls reach this hook as well. Advice is written about the main
+            // agent's work and is only actionable in the main agent's context: injected into a
+            // sub-agent it is noise the main agent never sees, and a blocker would deny a tool
+            // call the advice was never about.
+            const forSubAgent = await hookIsForSubAgent(HOOK_PRE_TOOL_USE, (i) =>
+                (Array.isArray(i?.toolCalls) ? i.toolCalls : []).some(
+                    (c) =>
+                        c?.name === input?.toolName &&
+                        // The main agent and a sub-agent can be running the same tool at once, so
+                        // the arguments discriminate where the name alone cannot. Matched only
+                        // when both sides expose them, so this narrows and never excludes.
+                        (typeof c?.args !== "string" ||
+                            typeof input?.toolArgs !== "string" ||
+                            c.args === input.toolArgs),
+                ),
+            );
+            if (forSubAgent) return;
 
             const advice = takePendingAdvice();
             if (!advice) return;
 
             if (advice.severity === "blocker" && cfg("blockOnBlocker")) {
-                // A denied call never runs, so no post hook fires to clear it. Left in place it
-                // would be shown to the next review as "executing right now", which could produce
-                // a blocker against a call that was already blocked.
-                markCallFinished(input?.toolName, input?.toolArgs);
                 debug(`delivering BLOCKER (denying tool call): ${advice.note}`);
                 recordAdvice(advice.severity, advice.note, `DENIED tool call: ${input?.toolName}`);
                 return {
@@ -920,16 +983,6 @@ const session = await joinSession({
             debug(`delivering ${advice.severity} as context: ${advice.note}`);
             recordAdvice(advice.severity, advice.note, `injected before: ${input?.toolName}`);
             return { additionalContext: formatAdvice(advice) };
-        },
-
-        onPostToolUse: async (input, invocation) => {
-            markCallFinished(input?.toolName, input?.toolArgs);
-            countToolCall(input?.toolName, invocation);
-        },
-
-        onPostToolUseFailure: async (input, invocation) => {
-            markCallFinished(input?.toolName, input?.toolArgs);
-            countToolCall(input?.toolName, invocation);
         },
     },
 
@@ -1073,7 +1126,11 @@ async function report(message) {
     }
 }
 
-function countToolCall(toolName, invocation) {
+// Counted from the event log rather than from the tool-use hooks: those fire for sub-agent tool
+// calls too and carry no agent identity, so a `task` sub-agent doing heavy work would drive the
+// review cadence on its own — and the advisor's own review agent would schedule the next review.
+function countToolCall(event) {
+    if (event?.agentId) return;
     if (!cfg("enabled")) return;
 
     state.toolCallsThisTurn++;
@@ -1085,7 +1142,6 @@ function countToolCall(toolName, invocation) {
 
     // Fire and forget: the main agent must not block on the review.
     void runCheck(session).catch(() => {});
-    void invocation;
 }
 
 // Reviews are expensive and most return nothing, so the interval widens while the agent is
@@ -1127,6 +1183,27 @@ if (config._problems?.length) {
             config._problems.map((p) => `  ${p}`).join("\n"),
     );
 }
+
+// Every path that has to distinguish the main agent from a sub-agent reads the event log, because
+// only these events carry an `agentId`.
+session.on((event) => {
+    switch (event?.type) {
+        case "hook.start":
+            noteHookStart(event);
+            break;
+        case "hook.end":
+            noteHookEnd(event);
+            break;
+        case "tool.execution_start":
+            // Recorded before counting, so a review this call triggers sees it as in flight.
+            noteCallStarted(event);
+            countToolCall(event);
+            break;
+        case "tool.execution_complete":
+            noteCallFinished(event);
+            break;
+    }
+});
 
 // Advice is normally delivered on the next tool call. A turn that ends without one would drop
 // it silently, so surface anything still pending when the session goes idle.
