@@ -185,7 +185,7 @@ advisor stop that call — see "What a blocker actually does".
 The advisor is also shown its own recent verdicts, so it can recognise a repeated failure rather
 than restating the same note every review.
 
-## Questions to the user are not agent work
+## Waiting on the user is not agent work
 
 `ask_user` is excluded from all of it: it is not counted towards the cadence, never appears in
 "what is executing right now", and never receives advice or a blocker. While a question is open
@@ -205,8 +205,21 @@ The tool name alone is not enough. The `user_input.requested` event that signals
 question arrives about a second *after* the `tool.execution_start` that raised it, so it cannot
 catch a review that the question itself triggers — hence both guards. Conversely the tool name
 alone cannot catch a review triggered by an earlier call that happens to finish while the question
-is on screen, which is the same crash with different timing. Pending questions are tracked by
-`requestId` across `user_input.requested` / `user_input.completed`.
+is on screen, which is the same crash with different timing.
+
+A question is not the only thing that stops the session on a human. Tool-permission prompts and
+MCP elicitations block it just as completely, and permission prompts have been measured sitting
+open for six and seven minutes — a wide window to announce a concern into. So the hold covers all
+three: `user_input`, `permission` and `elicitation`, each tracked by `requestId` across its
+`.requested` / `.completed` pair. The three id spaces are independent, so the keys are namespaced
+by kind to stop an id in one closing a prompt in another. A permission the hook resolves by itself
+is skipped, because it never reaches the user and so blocks nothing.
+
+Nothing expires on a timer. A prompt can legitimately sit unanswered for hours, and a timeout
+would fire a notification over a live prompt — the exact bug this avoids. The hold is released
+instead by the next user turn, which is positive evidence the user is back and that any prompt
+they were shown is moot. That keeps a dropped `.completed` event from silencing the advisor for
+the rest of the session.
 
 ## Cadence and backoff
 

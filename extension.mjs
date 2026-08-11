@@ -191,7 +191,7 @@ const state = {
     verdictHistory: [],
     consecutiveQuietChecks: 0,
     activeCalls: new Map(),
-    openUserInputs: new Set(),
+    openPrompts: new Set(),
     deferredTimelineAdvice: null,
     checksRun: 0,
     adviceDelivered: 0,
@@ -318,30 +318,48 @@ const MAX_ACTIVE_CALL_AGE_MS = 10 * 60 * 1000;
 // also sit in `activeCalls` for the full prune timeout and be shown to every review until then.
 const USER_INPUT_TOOLS = new Set(["ask_user"]);
 
-// True while a question is waiting on a human. `user_input.requested` arrives about a second
-// after the `tool.execution_start` that raised it, so this cannot be the only guard — the tool
-// name is what stops a review the question itself triggers. This stops the other case: a review
-// started by an earlier tool call finishing while the question is on screen.
-function awaitingUserInput() {
-    return state.openUserInputs.size > 0;
+// True while anything is waiting on a human: a question, a tool-permission prompt, or an MCP
+// elicitation. All three block the session on the user, and an error-level notification raised
+// over any of them is the failure that hung two sessions. `user_input.requested` arrives about a
+// second after the `tool.execution_start` that raised it, so this cannot be the only guard — the
+// tool name above is what stops a review the question itself triggers. This stops the other case:
+// a review started by an earlier tool call finishing while a prompt is on screen.
+//
+// Each event carries its own `requestId`, so keys are namespaced by kind to keep ids from
+// colliding across the three independent id spaces.
+const BLOCKING_PROMPTS = new Map([
+    ["user_input.requested", "ask"],
+    ["user_input.completed", "ask"],
+    ["permission.requested", "perm"],
+    ["permission.completed", "perm"],
+    ["elicitation.requested", "elicit"],
+    ["elicitation.completed", "elicit"],
+]);
+
+function awaitingUser() {
+    return state.openPrompts.size > 0;
 }
 
-function noteUserInputRequested(event) {
+function noteUserPromptOpened(event) {
     const id = event?.data?.requestId;
-    if (id) state.openUserInputs.add(id);
+    if (!id) return;
+    // A permission a hook already answered never reaches the user, so it blocks nothing.
+    if (event.data.resolvedByHook === true) return;
+    state.openPrompts.add(`${BLOCKING_PROMPTS.get(event.type)}:${id}`);
 }
 
-function noteUserInputCompleted(event) {
+function noteUserPromptClosed(event) {
     const id = event?.data?.requestId;
-    if (!id || !state.openUserInputs.delete(id)) return;
-    if (awaitingUserInput()) return;
+    if (!id) return;
+    if (!state.openPrompts.delete(`${BLOCKING_PROMPTS.get(event.type)}:${id}`)) return;
+    if (awaitingUser()) return;
 
-    // A verdict withheld while the question was pending is still worth showing, just not over
-    // the prompt. Deliver it now the user has answered rather than dropping it.
+    // A verdict withheld while the prompt was pending is still worth showing, just not over
+    // the prompt. Deliver it now the user has responded rather than dropping it.
     const advice = state.deferredTimelineAdvice;
     state.deferredTimelineAdvice = null;
     if (advice) {
-        debug(`reporting ${advice.severity} deferred past the pending question`);
+        debug(`reporting ${advice.severity} deferred past the pending prompt`);
         void report(formatTimelineAdvice(advice)).catch(() => {});
     }
 }
@@ -912,7 +930,7 @@ async function runCheck(session, { force = false } = {}) {
             // Reviews outlive the moment that triggered them, so one can finish while the agent
             // is waiting on an answer. Reporting then puts a notification over the pending
             // question — the failure that hung a session. Hold it until the user has answered.
-            if (awaitingUserInput()) {
+            if (awaitingUser()) {
                 debug(`deferring ${advice.severity} report: user input pending`);
                 state.deferredTimelineAdvice = advice;
             } else {
@@ -994,6 +1012,10 @@ const session = await joinSession({
             state.toolCallsSinceCheck = 0;
             state.pendingAdvice = null;
             state.deferredTimelineAdvice = null;
+            // A new user turn proves the user is present and any prompt they were being shown is
+            // resolved. Clearing here is what stops a missed completion event silencing the
+            // advisor for the rest of the session: the guard fails open at the next turn.
+            state.openPrompts.clear();
             state.lastAdviceNote = "";
             state.activeCalls.clear();
         },
@@ -1195,7 +1217,7 @@ function countToolCall(event) {
     if (state.toolCallsThisTurn < cfg("immuneToolCalls")) return;
     if (state.toolCallsSinceCheck < currentInterval()) return;
     if (state.checkInFlight || state.pendingAdvice) return;
-    if (awaitingUserInput()) return;
+    if (awaitingUser()) return;
 
     // Fire and forget: the main agent must not block on the review.
     void runCheck(session).catch(() => {});
@@ -1260,10 +1282,14 @@ session.on((event) => {
             noteCallFinished(event);
             break;
         case "user_input.requested":
-            noteUserInputRequested(event);
+        case "permission.requested":
+        case "elicitation.requested":
+            noteUserPromptOpened(event);
             break;
         case "user_input.completed":
-            noteUserInputCompleted(event);
+        case "permission.completed":
+        case "elicitation.completed":
+            noteUserPromptClosed(event);
             break;
     }
 });
@@ -1273,9 +1299,9 @@ session.on((event) => {
 session.on("session.idle", () => {
     const advice = state.pendingAdvice;
     if (!advice) return;
-    // Idle while a question is on screen is not the end of the turn, it is the turn waiting on
+    // Idle while a prompt is on screen is not the end of the turn, it is the turn waiting on
     // the user. Leave the advice pending rather than announcing it over the prompt.
-    if (awaitingUserInput()) return;
+    if (awaitingUser()) return;
     state.pendingAdvice = null;
     debug(`flushing undelivered ${advice.severity} at idle: ${advice.note}`);
     recordAdvice(advice.severity, advice.note, "undelivered, turn ended");
