@@ -144,7 +144,7 @@ relative, in which case they resolve against the CLI's log directory.
 | `timeoutMs`           | `180000`         | How long to wait for the advisor sub-agent.                              |
 | `pollIntervalMs`      | `2000`           | How often to check whether the review has finished.                      |
 | `logToTimeline`       | `true`           | Surface advice in the session timeline so you can see it too.            |
-| `timelineLevel`       | `"error"`        | Log level for advice. This host renders only `error`; see below.          |
+| `timelineLevel`       | `"info"`         | Log level for advice. Must not be `error`; see below.                     |
 | `debugLog`            | `"advisor.log"`  | Trace file for the review loop. Relative to the CLI log directory. `null` disables. |
 | `adviceLog`           | `"advisor-advice.log"` | Human-readable advice record read by `/advisor-log`. `null` disables. |
 | `instructions`        | `""`             | Extra project-specific review instructions appended to the prompt.       |
@@ -231,14 +231,37 @@ configured cadence immediately. `/advisor` shows the live interval and quiet str
 
 Advice is delivered into the agent's context, where you cannot see it. Two things make it visible:
 
-- **The timeline.** Each piece of advice is logged with a banner. Note that this host renders
-  **only `error`-level** extension logs — `info` and `warning` are persisted but never displayed —
-  so `timelineLevel` defaults to `error` and the real severity is carried in the message text.
+- **The timeline.** Each piece of advice is logged with a banner, at `info` level. Be aware that
+  this host currently renders *no* level of extension log in the app window, so the timeline copy
+  is effectively write-only here — use the advice log below. `timelineLevel` deliberately does not
+  default to `error`: see [Advice is not a session failure](#advice-is-not-a-session-failure).
 - **The advice log.** A human-readable record of every outcome: raised, injected, denied, dropped
   as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup.
 
 Log paths are suffixed with the session id, because otherwise concurrent sessions interleave
 their entries into a single unreadable file.
+
+## Advice is not a session failure
+
+Advice is logged at `info`. It must never be logged at `error`, and that is not a style
+preference — the host treats it as a terminal fault.
+
+An extension log at error level becomes a `session.error` event carrying `errorType:
+"notification"`. The host classifies *any* `session.error` whose `errorType` is not `model_call`
+as terminal: it sets `hasError`, which stops an autopilot run with reason `"error"` and leaves the
+session marked failed. So an advisor that reported at error level halted the very sessions it was
+supposed to be helping — every concern it raised ended the run. The symptom is easy to
+misdiagnose, because the event stream carries on normally; what dies is the continuation loop and
+the session's status, neither of which appears in the transcript.
+
+`warning` is the middle option: non-terminal, except for the two warning types the host reserves
+(`compaction_static_context_blocked`, `policy_blocked`), which an extension notification is not.
+It is a safe choice on a host that renders warnings.
+
+The trade is visibility. This host renders no level of extension log in the app window — measured,
+by emitting at all three — so nothing is lost by dropping to `info` here, and a session that keeps
+running is worth more than a banner that never appears. Advice still reaches the agent by
+injection on its next tool call, and reaches you through the advice log.
 
 ## Prompt injection into the review transcript
 

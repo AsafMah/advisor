@@ -14,7 +14,7 @@
     "timeoutMs": 180000,
     "pollIntervalMs": 2000,
     "logToTimeline": true,
-    "timelineLevel": "error",
+    "timelineLevel": "info",
     "debugLog": "advisor.log",
     "adviceLog": "advisor-advice.log",
     "instructions": ""

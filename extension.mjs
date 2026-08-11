@@ -28,10 +28,18 @@ const DEFAULTS = {
     timeoutMs: 180000,
     pollIntervalMs: 2000,
     logToTimeline: true,
-    // Only error-level logs are rendered by the app host; info and warning are persisted to the
-    // event log but never shown, which is why advice was invisible. The severity is carried in
-    // the message text instead. Lower this on a host that renders info.
-    timelineLevel: "error",
+    // Advice goes out at info level because the alternative breaks sessions. The host classifies
+    // every `session.error` whose `errorType` is not `model_call` as a *terminal* error, and an
+    // extension notification is `errorType: "notification"` — so each concern set `hasError`,
+    // which stops an autopilot run with reason "error" and leaves the session marked failed.
+    // Reporting advice is not a session failure, so it must not be reported as one.
+    //
+    // The cost is that this host renders none of the three levels in the app window, so the
+    // timeline copy is effectively write-only here. That is acceptable: advice reaches the agent
+    // by injection on its next tool call, and reaches the user through `adviceLog`. Raise this on
+    // a host that renders info, and note that `warning` is also non-terminal except for the
+    // host's two reserved warning types.
+    timelineLevel: "info",
     // Relative paths resolve against the CLI's log directory, so a shared config stays portable.
     debugLog: "advisor.log",
     adviceLog: "advisor-advice.log",
@@ -1191,8 +1199,8 @@ const session = await joinSession({
     ],
 });
 
-// Command output and advice must go out at a level the host actually renders — see the comment
-// on `timelineLevel`. A plain `session.log` at info level is silently swallowed.
+// The severity is carried in the message text, not in the log level — see the comment on
+// `timelineLevel` for why advice must not go out at error level.
 async function report(message) {
     try {
         await session.log(message, { level: cfg("timelineLevel") });
