@@ -191,6 +191,8 @@ const state = {
     verdictHistory: [],
     consecutiveQuietChecks: 0,
     activeCalls: new Map(),
+    openUserInputs: new Set(),
+    deferredTimelineAdvice: null,
     checksRun: 0,
     adviceDelivered: 0,
     lastError: null,
@@ -307,9 +309,47 @@ function renderEvent(event) {
 // the pre-tool-use hook does, so tracking them loses no immediacy.
 const MAX_ACTIVE_CALL_AGE_MS = 10 * 60 * 1000;
 
+// Asking the user a question is not work to be reviewed, it is the agent handing control back.
+// Treating it as work is actively harmful, and every way it goes wrong was observed in one
+// session: the question and its choices were fed to a review as "what the agent is doing now",
+// so the advisor critiqued the question rather than the work; the call drove the review cadence,
+// so the review fired at the very moment the user was being asked; and the notification landed
+// on top of the pending question. The call never completes until the user answers, so it would
+// also sit in `activeCalls` for the full prune timeout and be shown to every review until then.
+const USER_INPUT_TOOLS = new Set(["ask_user"]);
+
+// True while a question is waiting on a human. `user_input.requested` arrives about a second
+// after the `tool.execution_start` that raised it, so this cannot be the only guard — the tool
+// name is what stops a review the question itself triggers. This stops the other case: a review
+// started by an earlier tool call finishing while the question is on screen.
+function awaitingUserInput() {
+    return state.openUserInputs.size > 0;
+}
+
+function noteUserInputRequested(event) {
+    const id = event?.data?.requestId;
+    if (id) state.openUserInputs.add(id);
+}
+
+function noteUserInputCompleted(event) {
+    const id = event?.data?.requestId;
+    if (!id || !state.openUserInputs.delete(id)) return;
+    if (awaitingUserInput()) return;
+
+    // A verdict withheld while the question was pending is still worth showing, just not over
+    // the prompt. Deliver it now the user has answered rather than dropping it.
+    const advice = state.deferredTimelineAdvice;
+    state.deferredTimelineAdvice = null;
+    if (advice) {
+        debug(`reporting ${advice.severity} deferred past the pending question`);
+        void report(formatTimelineAdvice(advice)).catch(() => {});
+    }
+}
+
 function noteCallStarted(event) {
     const { toolCallId, toolName, arguments: toolArgs } = event?.data ?? {};
     if (event?.agentId || !toolCallId || !toolName) return;
+    if (USER_INPUT_TOOLS.has(toolName)) return;
     state.activeCalls.set(toolCallId, { toolName, toolArgs, startedAt: Date.now() });
 }
 
@@ -869,7 +909,15 @@ async function runCheck(session, { force = false } = {}) {
         if (state.verdictHistory.length > VERDICT_HISTORY_LIMIT) state.verdictHistory.shift();
 
         if (cfg("logToTimeline")) {
-            await report(formatTimelineAdvice(advice));
+            // Reviews outlive the moment that triggered them, so one can finish while the agent
+            // is waiting on an answer. Reporting then puts a notification over the pending
+            // question — the failure that hung a session. Hold it until the user has answered.
+            if (awaitingUserInput()) {
+                debug(`deferring ${advice.severity} report: user input pending`);
+                state.deferredTimelineAdvice = advice;
+            } else {
+                await report(formatTimelineAdvice(advice));
+            }
         }
         recordAdvice(advice.severity, advice.note, "raised");
         return advice;
@@ -945,6 +993,7 @@ const session = await joinSession({
             state.toolCallsThisTurn = 0;
             state.toolCallsSinceCheck = 0;
             state.pendingAdvice = null;
+            state.deferredTimelineAdvice = null;
             state.lastAdviceNote = "";
             state.activeCalls.clear();
         },
@@ -967,6 +1016,12 @@ const session = await joinSession({
                 ),
             );
             if (forSubAgent) return;
+
+            // Never act on a call that is asking the user something. A blocker here would deny
+            // the agent the one action that resolves the ambiguity the advisor is worried about,
+            // and context injected into a question the user is already reading is pointless.
+            // The advice stays pending and lands on the next call that is actually work.
+            if (USER_INPUT_TOOLS.has(input?.toolName)) return;
 
             const advice = takePendingAdvice();
             if (!advice) return;
@@ -1132,6 +1187,7 @@ async function report(message) {
 function countToolCall(event) {
     if (event?.agentId) return;
     if (!cfg("enabled")) return;
+    if (USER_INPUT_TOOLS.has(event?.data?.toolName)) return;
 
     state.toolCallsThisTurn++;
     state.toolCallsSinceCheck++;
@@ -1139,6 +1195,7 @@ function countToolCall(event) {
     if (state.toolCallsThisTurn < cfg("immuneToolCalls")) return;
     if (state.toolCallsSinceCheck < currentInterval()) return;
     if (state.checkInFlight || state.pendingAdvice) return;
+    if (awaitingUserInput()) return;
 
     // Fire and forget: the main agent must not block on the review.
     void runCheck(session).catch(() => {});
@@ -1202,6 +1259,12 @@ session.on((event) => {
         case "tool.execution_complete":
             noteCallFinished(event);
             break;
+        case "user_input.requested":
+            noteUserInputRequested(event);
+            break;
+        case "user_input.completed":
+            noteUserInputCompleted(event);
+            break;
     }
 });
 
@@ -1210,6 +1273,9 @@ session.on((event) => {
 session.on("session.idle", () => {
     const advice = state.pendingAdvice;
     if (!advice) return;
+    // Idle while a question is on screen is not the end of the turn, it is the turn waiting on
+    // the user. Leave the advice pending rather than announcing it over the prompt.
+    if (awaitingUserInput()) return;
     state.pendingAdvice = null;
     debug(`flushing undelivered ${advice.severity} at idle: ${advice.note}`);
     recordAdvice(advice.severity, advice.note, "undelivered, turn ended");

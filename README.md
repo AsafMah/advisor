@@ -185,6 +185,29 @@ advisor stop that call — see "What a blocker actually does".
 The advisor is also shown its own recent verdicts, so it can recognise a repeated failure rather
 than restating the same note every review.
 
+## Questions to the user are not agent work
+
+`ask_user` is excluded from all of it: it is not counted towards the cadence, never appears in
+"what is executing right now", and never receives advice or a blocker. While a question is open
+the advisor also starts no new review, and holds any verdict that lands until the user answers.
+
+Each of those is a failure that was observed rather than imagined. Treating the call as work fed
+the question and its multiple-choice options to the reviewer, which then critiqued the *question*
+instead of the work. Counting it towards the cadence made the question itself trigger a review, so
+the review fired at the exact moment the user was being asked. The verdict then arrived as an
+error-level notification on top of the pending prompt, and the session hung — twice, in unrelated
+sessions. A blocker would have been worse still: it would deny the agent the one action that
+resolves the ambiguity the advisor was worried about. The call also never completes until the user
+answers, so it would otherwise have sat in the in-flight set until the prune timeout and been
+shown to every review in between.
+
+The tool name alone is not enough. The `user_input.requested` event that signals a pending
+question arrives about a second *after* the `tool.execution_start` that raised it, so it cannot
+catch a review that the question itself triggers — hence both guards. Conversely the tool name
+alone cannot catch a review triggered by an earlier call that happens to finish while the question
+is on screen, which is the same crash with different timing. Pending questions are tracked by
+`requestId` across `user_input.requested` / `user_input.completed`.
+
 ## Cadence and backoff
 
 Reviews are expensive and most find nothing, so the interval doubles after each quiet review —
