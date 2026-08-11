@@ -144,7 +144,7 @@ relative, in which case they resolve against the CLI's log directory.
 | `timeoutMs`           | `180000`         | How long to wait for the advisor sub-agent.                              |
 | `pollIntervalMs`      | `2000`           | How often to check whether the review has finished.                      |
 | `logToTimeline`       | `true`           | Surface advice in the session timeline so you can see it too.            |
-| `timelineLevel`       | `"info"`         | Log level for advice. Must not be `error`; see below.                     |
+| `timelineLevel`       | `"info"`         | Log level for advice. `error` is refused; see below.                      |
 | `debugLog`            | `"advisor.log"`  | Trace file for the review loop. Relative to the CLI log directory. `null` disables. |
 | `adviceLog`           | `"advisor-advice.log"` | Human-readable advice record read by `/advisor-log`. `null` disables. |
 | `instructions`        | `""`             | Extra project-specific review instructions appended to the prompt.       |
@@ -257,6 +257,11 @@ the session's status, neither of which appears in the transcript.
 `warning` is the middle option: non-terminal, except for the two warning types the host reserves
 (`compaction_static_context_blocked`, `policy_blocked`), which an extension notification is not.
 It is a safe choice on a host that renders warnings.
+
+Setting `timelineLevel: "error"` is therefore not honoured. It is coerced back to the default and
+the reason is reported at startup, because the terminal classification lives in the CLI itself
+rather than in a host-specific display layer — so there is no host on which the setting is merely
+cosmetic, and an old config carrying it would silently break every session it advised.
 
 The trade is visibility. This host renders no level of extension log in the app window — measured,
 by emitting at all three — so nothing is lost by dropping to `info` here, and a session that keeps

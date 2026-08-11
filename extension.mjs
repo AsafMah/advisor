@@ -152,6 +152,17 @@ function validateConfig(raw) {
                 ` (must be one of ${LOG_LEVELS.join(", ")})`,
         );
         clean.timelineLevel = DEFAULTS.timelineLevel;
+    } else if (clean.timelineLevel === "error") {
+        // Not a taste question. An extension log at error level is a `session.error`, which the
+        // CLI classifies as a terminal fault and uses to stop autopilot and fail the session, so
+        // honouring this setting would break the very session it is advising. The check lives
+        // here rather than in LOG_LEVELS so the reason is reported instead of a bare "invalid".
+        problems.push(
+            'timelineLevel="error" is not supported: the CLI treats an error-level extension log' +
+                " as a terminal session failure, which stops autopilot and marks the session" +
+                ` failed. Using "${DEFAULTS.timelineLevel}" instead.`,
+        );
+        clean.timelineLevel = DEFAULTS.timelineLevel;
     }
 
     clean._problems = problems;
