@@ -51,18 +51,18 @@ const DEFAULTS = {
     // which stops an autopilot run with reason "error" and leaves the session marked failed.
     // Reporting advice is not a session failure, so it must not be reported as one.
     //
-    // Whether any of this reaches the user's window is the app's business, not this code's:
-    // these banners rendered until mid-August 2026 and then stopped, with no change on either
-    // side. So treat rendering as something to re-check rather than a property to rely on. What
-    // does not depend on it: advice reaches the agent by injection on its next tool call, and
-    // both `adviceLog` and the session transcript record it. `warning` is also non-terminal,
-    // except for the host's two reserved warning types.
+    // Whether any of this reaches the user's window is the app's business, not this code's: it is
+    // a known app bug, github/app#2765, fixed once in app v1.1.8 and regressed since. Nothing
+    // here is involved and no change here fixes it. What does not depend on it: advice reaches
+    // the agent by injection on its next tool call, and both `adviceLog` and the session
+    // transcript record it. `warning` is also non-terminal, except for the host's two reserved
+    // warning types.
     //
-    // Do not reach for `{ ephemeral: true }` when nothing appears. It is the obvious candidate,
-    // it does not restore rendering, and it is actively harmful: an ephemeral log is not
-    // persisted, so it writes no `session.info` event into the transcript — destroying the one
-    // read-back channel that still works while rendering is broken. Measured both ways on the
-    // same forced `report()` call; only the non-ephemeral one left a record.
+    // Do not reach for `{ ephemeral: true }` when nothing appears. `ephemeral` means transient:
+    // the line is drawn and dropped on the next redraw, and nothing is persisted — so it writes
+    // no `session.info` event into the transcript, which is the read-back record. Measured with a
+    // probe emitting both ways in one CLI run: the ephemeral line rendered and left no event, the
+    // plain one left exactly one. It is not an alternative to a durable log; it is the opposite.
     timelineLevel: "info",
     // Relative paths resolve against the CLI's log directory, so a shared config stays portable.
     debugLog: "advisor.log",

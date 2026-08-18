@@ -279,39 +279,58 @@ decided whether anything appeared.
 
 ### When advice does not appear in the window
 
-At the time of writing it does not, and that is the app's doing rather than this extension's: these
-banners rendered until mid-August 2026 and then stopped, with no change on either side. Asaf
-confirms he used to see `ADVISOR · CONCERN` banners appear on their own. So this is a regression to
-wait out, not a property to design around — and the delivery path that matters never depended on it,
-because advice is injected into the agent's context on its next tool call.
+It is an app bug, not an extension bug: **[github/app#2765](https://github.com/github/app/issues/2765)**,
+"Extensions who send `info` or `warning` level logs are not shown in the app". It was fixed once, in
+app v1.1.8, and has regressed since. Nothing in this extension is involved, and no change here will
+fix it — advice still reaches the agent by injection on its next tool call, and is still recorded.
 
-To check what is true now, rather than trusting this paragraph: emit a message and look, and grep
-the session transcript for what was recorded.
+Two commands decide, between them, where a missing message actually went. Run the first one *first*:
+it is objective, needs no observer, and separates a display bug from an emission bug in one step.
 
 ```powershell
-# every user-facing message this session recorded
+# 1. Does the CLI render it? Same binary the app drives, plain terminal.
+#    Renders here but not in the app  =>  the app's display path, i.e. #2765.
+copilot -p "Reply with exactly: ok" --allow-all-tools
+
+# 2. Was it emitted and recorded at all? Present here => emission is fine.
 Select-String -Path "$env:USERPROFILE\.copilot\session-state\<session-id>\events.jsonl" `
   -Pattern '"type":"session.info"'
 ```
 
+Do not try to settle this by asking someone whether they saw a message. The app auto-dismisses
+notifications after a configurable **Announcement duration**, so "it never appeared" and "it appeared
+and vanished before I looked" are the same answer from a witness asked after the fact. Every probe
+run against this bug except one was confounded that way. If a human must be the instrument, have them
+watch the window live and forewarned — otherwise use command 1.
+
 ### Do not reach for `ephemeral: true`
 
-It is the obvious candidate when nothing renders, both this extension and `self-learn` tried it, and
-it is worse than the problem. It does not restore rendering — and because an ephemeral log is
-explicitly *not persisted*, it writes no `session.info` event either, destroying the one read-back
-channel that still works while rendering is broken.
+It is the obvious candidate when messages stop appearing, and both this extension and `self-learn`
+tried it. It is the wrong tool, but not because it is broken: `ephemeral` means **transient**. The
+line is drawn and then dropped on the next redraw, and nothing is persisted — a reasonable design for
+a status message you do not want cluttering a transcript, and the wrong choice for advice.
 
-Measured on the same forced `report()` call, non-ephemeral and ephemeral: only the non-ephemeral one
-left a `session.info` in `events.jsonl`. Across this repository's entire session history the only
-message that never appears in a transcript is the startup banner, which was the only call passing
-the flag.
+Measured under the terminal CLI, where rendering works, with one probe emitting both ways in a single
+run: the ephemeral line appeared in the output but left **no** `session.info` event, while the plain
+one left exactly one. The same comparison on a forced `report()` call gives the same answer.
 
-The flag is convincing because it correlates perfectly with visibility — the only call passing it
-was also the only call made during extension init, so two dimensions moved together and only one
-mattered. The general form of the mistake is worth more than this instance: when output is correct
-at every layer you control, suspect the layer you do not, and ask "did this ever work?" before
-asking "what did I break?". That question costs one sentence and would have redirected this
-investigation on day one.
+So it is not an alternative to a durable log, it is the opposite of one. Note that this extension's
+startup banner was the only advisor message ever missing from a transcript, and passing this flag was
+the only thing distinguishing it.
+
+Two mistakes are worth recording, because both were committed twice here:
+
+- **The flag correlated perfectly with visibility** — the only call passing it was also the only call
+  made during extension init, so two dimensions moved together and only one mattered. Structural
+  corroboration of a mechanism is not evidence that the mechanism produces the effect, and it is a
+  comfortable substitute because it feels like checking.
+- **The flag was first characterised in the app**, whose display was broken, so its rendering effect
+  was masked and it looked inert. You cannot characterise a display option on a host whose display
+  does not work. The CLI answered it in one command.
+
+The general form: when output is correct at every layer you control, suspect the layer you do not,
+and ask "did this ever work?" before "what did I break?". Here the answer was an issue the user had
+already filed, eight days earlier, about this very extension.
 
 ## Prompt injection into the review transcript
 
