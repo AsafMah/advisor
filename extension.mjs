@@ -973,6 +973,17 @@ const session = await joinSession({
             // Blocking while a prompt is open would answer a question the user is being asked.
             if (awaitingUser()) return;
 
+            // Only a turn that ended normally. The runtime documents that it already withholds
+            // this hook from aborted turns, but "the runtime filters it" is the kind of assumption
+            // that is silently wrong after an upgrade, and the failure would be reopening work the
+            // user had just interrupted. Gating fails safe: the advice stays undelivered, which is
+            // exactly the behaviour that existed before this hook. `end_turn` is the only reason
+            // observed on this host, so anything else is logged rather than guessed at.
+            if (input?.stopReason !== "end_turn") {
+                debug(`ignoring agent stop with stopReason=${input?.stopReason}`);
+                return;
+            }
+
             debug(`main-agent stop: pending=${state.pendingAdvice?.severity ?? "none"}`);
 
             // Checked before consuming: anything that is not a blocker we are willing to act on
