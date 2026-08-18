@@ -277,6 +277,25 @@ by emitting at all three — so nothing is lost by dropping to `info` here, and 
 running is worth more than a banner that never appears. Advice still reaches the agent by
 injection on its next tool call, and reaches you through the advice log.
 
+### `ephemeral: true` does not make it visible
+
+It is the obvious next thing to try, and it has been tried. `session.log(msg, { ephemeral: true })`
+emitted after init produces nothing: no output from a live turn, none after an `extensions_reload`,
+and no throw. What renders is not decided by the level or by the flag — this host shows extension
+output **only during extension init**, which is why the startup banner is the one message that ever
+appears.
+
+The flag is a tempting explanation because it correlates perfectly with visibility: the only call
+that passes it is also the only call made during init. Two dimensions moved together and only one
+of them mattered. Before concluding that some flag is what makes output appear, emit one message
+*after* init both with and without it — that single comparison is what separates the two.
+
+The practical consequence is that this host has no passive user-visible channel at all. The
+complete set is the init banner and `session.ui` (`elicitation`, `confirm`, `select`, `input`),
+every one of which demands an answer. So injection into the agent's context is not advisor's
+fallback path; it is the only delivery mechanism that exists here, and the advice log is how a
+human reads back what was said.
+
 ## Prompt injection into the review transcript
 
 The transcript is assembled from the session event log, which contains text the advisor must not

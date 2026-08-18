@@ -56,6 +56,12 @@ const DEFAULTS = {
     // by injection on its next tool call, and reaches the user through `adviceLog`. Raise this on
     // a host that renders info, and note that `warning` is also non-terminal except for the
     // host's two reserved warning types.
+    //
+    // `{ ephemeral: true }` is not the missing ingredient, and has been tried: this host renders
+    // extension output only during extension init, which is why the startup banner below is the
+    // one message that ever shows. Measured after a reload and from a live turn — nothing
+    // appeared either way, with or without the flag. The flag looks decisive only because the
+    // sole call that passes it is also the sole call made during init.
     timelineLevel: "info",
     // Relative paths resolve against the CLI's log directory, so a shared config stays portable.
     debugLog: "advisor.log",
