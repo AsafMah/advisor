@@ -213,6 +213,7 @@ const state = {
     openPrompts: new Set(),
     deferredTimelineAdvice: null,
     checksRun: 0,
+    staleTaskId: null,
     adviceDelivered: 0,
     lastError: null,
     lastReportedError: null,
@@ -678,6 +679,20 @@ async function runAdvisorAgent(session, prompt) {
         baseline = 0;
     }
 
+    // The previous review's task is deliberately left in the list when its completion notification
+    // may already have gone out, so that a `read_agent` following that notification finds it.
+    // Nothing will read it once a new review starts, so clear it here — this bounds the leftovers
+    // to a single entry instead of letting idle tasks accumulate.
+    if (state.staleTaskId) {
+        const stale = state.staleTaskId;
+        state.staleTaskId = null;
+        try {
+            await rpc.tasks.remove({ id: stale });
+        } catch {
+            // Already gone.
+        }
+    }
+
     // When `model` is unset the agent definition's own model and reasoning effort apply. The
     // startAgent RPC has no effort parameter, so a dedicated custom agent is the only way to
     // pin the advisor's reasoning level.
@@ -697,6 +712,10 @@ async function runAdvisorAgent(session, prompt) {
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
     let emptySettledPolls = 0;
+    // Once the sub-agent has reached `subagent.completed` the CLI has already emitted its "agent
+    // has finished" notification, so the task has to survive long enough for a `read_agent` that
+    // follows it. Tracked here so the cleanup below knows which case it is in.
+    let completedBeforeReply = false;
 
     try {
         while (Date.now() < deadline) {
@@ -724,8 +743,40 @@ async function runAdvisorAgent(session, prompt) {
             if (task.status === "failed") throw new Error(task.error || "advisor agent failed");
             if (task.status === "cancelled") throw new Error("advisor agent was cancelled");
 
-            // Exact correlation: keyed by the task id we own, so unlike event-log matching these
-            // cannot pick up the self-learn extension's or the main agent's sub-agent.
+            // The event log is checked first because it is the only signal that arrives early
+            // enough to matter. Measured on this host: `task.result` stays null for the entire
+            // run, and `task.latestResponse` is not populated until the same poll that reports
+            // `subagent.completed` — by which point the CLI has already emitted its "agent has
+            // finished" notification. The verdict message lands in the event log roughly 8s
+            // before that, which is the window this uses.
+            const { status, reply, completed } = await readAgentReplyFromEventLog(
+                session,
+                task.toolCallId,
+                baseline,
+            );
+            if (status === "failed") throw new Error(reply);
+            if (completed) completedBeforeReply = true;
+
+            // Only a reply that actually parses short-circuits here. Anything less falls through
+            // to the task fields below, which is the order the previous implementation used and
+            // is what stops a blank or half-formed message hiding a verdict they might carry.
+            if (status === "done" && reply && !parseVerdict(reply).unparseable) {
+                // Cancel as soon as the verdict is usable, not when the agent finishes. The CLI's
+                // completion callback returns early for a cancelled task without notifying, so
+                // this is what stops the main agent being told to `read_agent` a task the advisor
+                // is about to dispose of.
+                if (completed) {
+                    debug(`reply via event log (agent had already completed)`);
+                } else {
+                    await cancelTask(rpc, agentId);
+                    debug(`reply via event log; cancelled before completion`);
+                }
+                return reply;
+            }
+
+            // Fallbacks, keyed by the task id we own and so equally safe from picking up the
+            // self-learn extension's or the main agent's sub-agent. Neither arrives early enough
+            // to avoid the completion notification, but they cover a reply the event log missed.
             if (task.result) {
                 debug(`reply via task.result`);
                 return task.result;
@@ -735,14 +786,10 @@ async function runAdvisorAgent(session, prompt) {
                 return task.latestResponse;
             }
 
-            // The task parks in "idle" without ever exposing a result, so the event log is the
-            // real completion signal.
-            const { status, reply } = await readAgentReplyFromEventLog(session, task.toolCallId, baseline);
-            if (status === "failed") throw new Error(reply);
-            if (status === "done") {
-                debug(`reply via event log (fallback)`);
-                return reply;
-            }
+            // The agent has finished and nothing carries a better answer, so this is all there
+            // will ever be. Hand it back — blank or unparseable — and let the caller reject it
+            // rather than sitting here until the timeout.
+            if (status === "done" && completed) return reply;
 
             // A sub-agent reports "idle" from the moment it starts, so this cannot simply mean
             // "finished". Only give up once it has been settled without a reply for a while —
@@ -762,57 +809,70 @@ async function runAdvisorAgent(session, prompt) {
         throw new Error(`advisor agent timed out after ${cfg("timeoutMs")}ms`);
     } finally {
         // The agent parks idle and would otherwise accumulate in the task list forever.
-        await disposeTask(rpc, agentId);
+        await disposeTask(rpc, agentId, { keepReadable: completedBeforeReply });
     }
 }
 
-// `tasks.list()` leaves `result` null for a sub-agent that parks in "idle", so the reply has to be
-// recovered from the session event log. Sub-agent events are tagged with an internal agent id
-// (`bg-…`) that differs from the task id (`advisor-…`). An agent started over RPC has no parent
-// tool invocation, so `toolCallId` cannot be relied on for correlation — match on the sub-agent's
-// description instead, scoped to events emitted after this review began.
+// `tasks.list()` leaves `result` null for a sub-agent that parks in "idle", and does not populate
+// `latestResponse` until the poll that also reports completion, so the session event log is the
+// only place the verdict appears early enough to act on.
+//
+// Correlation is exact and one-to-one: `subagent.started.data.toolCallId` carries the sub-agent's
+// own internal `bg-…` id, which is also the `toolCallId` that `tasks.list()` reports for the task
+// we started, so this cannot pick up the self-learn extension's or the main agent's sub-agent.
+// Measured over 1357 `subagent.started` events on this host that field was present every time,
+// while `data.agentDescription` holds the *agent type's* description and never the `description`
+// passed to `startAgent` — matching on it scored 0/1357 and has been removed as dead.
+//
+// `completed` is reported separately from `status` on purpose: a reply is usable as soon as it is
+// readable, which is well before the agent finishes, and the caller needs to know which of the two
+// it has in order to decide whether cancelling can still suppress the completion notification.
 async function readAgentReplyFromEventLog(session, toolCallId, baseline) {
+    const pending = { status: "pending", reply: "", completed: false };
+    if (!toolCallId) return pending;
+
     let events = [];
     try {
         events = await session.getEvents();
     } catch {
-        return { status: "pending", reply: "" };
+        return pending;
     }
 
     const recent = events.slice(baseline);
 
-    // The baseline is captured immediately before the sub-agent is started, but other sub-agents
-    // can start in the same window — the main agent's own, or another extension's. Only an exact
-    // match is safe: guessing by model or by "first one after the baseline" would parse a foreign
-    // agent's message as this review's verdict.
     const started = recent.find(
-        (e) =>
-            e?.type === "subagent.started" &&
-            e?.agentId &&
-            (e?.data?.agentDescription === ADVISOR_TASK_DESCRIPTION ||
-                (toolCallId && e?.data?.toolCallId === toolCallId)),
+        (e) => e?.type === "subagent.started" && e?.data?.toolCallId === toolCallId,
     );
-
-    if (!started) return { status: "pending", reply: "" };
+    if (!started) return pending;
 
     const internalId = started.agentId;
     const mine = (e) => e?.agentId === internalId;
 
     const failed = recent.find((e) => e?.type === "subagent.failed" && mine(e));
-    if (failed) return { status: "failed", reply: failed?.data?.error ?? "sub-agent failed" };
-
-    if (!recent.some((e) => e?.type === "subagent.completed" && mine(e))) {
-        return { status: "pending", reply: "" };
+    if (failed) {
+        return {
+            status: "failed",
+            reply: failed?.data?.error ?? "sub-agent failed",
+            completed: true,
+        };
     }
+
+    const completed = recent.some((e) => e?.type === "subagent.completed" && mine(e));
 
     const replies = recent
         .filter((e) => e?.type === "assistant.message" && mine(e))
         .map((e) => e?.data?.content)
         .filter((c) => typeof c === "string" && c.trim());
 
-    if (replies.length === 0) return { status: "done", reply: "" };
+    // An empty reply must never be reported as ready while the agent is still working: it parses
+    // as a clean "none", so treating it as an answer would silently pass off an unfinished review
+    // as a verdict.
+    if (replies.length === 0) {
+        return completed ? { status: "done", reply: "", completed } : pending;
+    }
+
     debug(`recovered reply for ${internalId} from event log (${replies.length} message(s))`);
-    return { status: "done", reply: replies[replies.length - 1] };
+    return { status: "done", reply: replies[replies.length - 1], completed };
 }
 
 // The advisor can only learn what the user asked for through the transcript, so a verdict that
@@ -867,18 +927,33 @@ async function dumpEventDiagnostics(session, baseline) {
     }
 }
 
-async function disposeTask(rpc, agentId) {
-    // Bounded: an unresolved cancel would hold `checkInFlight` true forever and stop all reviews.
-    const bounded = (promise) =>
-        Promise.race([promise, new Promise((resolve) => setTimeout(resolve, DISPOSE_TIMEOUT_MS))]);
+// Bounded: an unresolved cancel would hold `checkInFlight` true forever and stop all reviews.
+const boundedTaskCall = (promise) =>
+    Promise.race([promise, new Promise((resolve) => setTimeout(resolve, DISPOSE_TIMEOUT_MS))]);
 
+async function cancelTask(rpc, agentId) {
     try {
-        await bounded(rpc.tasks.cancel({ id: agentId }));
+        await boundedTaskCall(rpc.tasks.cancel({ id: agentId }));
     } catch {
         // Already settled.
     }
+}
+
+// Cancelling is what suppresses the CLI's "agent has finished" notification, but it only does so
+// while the task is still running. When the agent completed first the notification has already
+// gone out, and removing the task then turns the main agent's follow-up `read_agent` into
+// "Agent not found" — the confusing error this is meant to avoid. Leave that one readable and let
+// the next review clear it.
+async function disposeTask(rpc, agentId, { keepReadable = false } = {}) {
+    await cancelTask(rpc, agentId);
+
+    if (keepReadable) {
+        state.staleTaskId = agentId;
+        return;
+    }
+
     try {
-        await bounded(rpc.tasks.remove({ id: agentId }));
+        await boundedTaskCall(rpc.tasks.remove({ id: agentId }));
     } catch {
         // Not removable; nothing more we can do.
     }
