@@ -553,7 +553,10 @@ test("validateConfig", async (t) => {
 });
 
 test("isMainAgentStop", async (t) => {
-    const MAIN = "5eec87ee-9591-45a0-a046-61deb374ed2a";
+    // Synthetic ids, shaped like the real ones measured on 1.0.80 rather than captured from a
+    // live session: a plain uuid for the main agent, `toolu_01` + 22 chars for a `task`
+    // sub-agent, `bg-` + uuid for an RPC-started one. Only the shapes are load-bearing.
+    const MAIN = "11111111-2222-4333-8444-555555555555";
 
     await t.test("the main agent's own stop is recognised", () => {
         assert.equal(isMainAgentStop({ sessionId: MAIN }, MAIN), true);
@@ -563,12 +566,12 @@ test("isMainAgentStop", async (t) => {
     // carries bg-<uuid>. Both must be rejected, or the advisor holds a sub-agent's turn open over
     // advice written about the main agent — including its own review sub-agent's turn.
     await t.test("a task sub-agent's stop is rejected", () => {
-        assert.equal(isMainAgentStop({ sessionId: "toolu_01CpQs6FRexSmdhxMMarHNZv" }, MAIN), false);
+        assert.equal(isMainAgentStop({ sessionId: "toolu_01AbCdEfGhIjKlMnOpQrSt" }, MAIN), false);
     });
 
     await t.test("an rpc sub-agent's stop is rejected", () => {
         assert.equal(
-            isMainAgentStop({ sessionId: "bg-a6365553-0b55-4032-96cd-6fcb6506f22c" }, MAIN),
+            isMainAgentStop({ sessionId: "bg-99999999-8888-4777-8666-555555555555" }, MAIN),
             false,
         );
     });
