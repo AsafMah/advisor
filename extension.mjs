@@ -760,6 +760,16 @@ async function runAdvisorAgent(session, prompt) {
             // Only a reply that actually parses short-circuits here. Anything less falls through
             // to the task fields below, which is the order the previous implementation used and
             // is what stops a blank or half-formed message hiding a verdict they might carry.
+            //
+            // The recogniser must match what THIS agent was asked for, not merely "is it JSON".
+            // `parseVerdict` qualifies: it requires a known `severity`, so a preamble or a
+            // differently-shaped reply keeps us waiting instead of truncating the review with a
+            // confidently wrong answer. Anyone adding a second, differently-prompted sub-agent
+            // must give it its own recogniser — sharing this one would silently opt it out of
+            // cancellation and bring the spurious completion notifications straight back.
+            //
+            // `reply` must be checked before parsing: an empty string parses as a clean "none",
+            // so without it a still-working agent would be cancelled and reported as no concerns.
             if (status === "done" && reply && !parseVerdict(reply).unparseable) {
                 // Cancel as soon as the verdict is usable, not when the agent finishes. The CLI's
                 // completion callback returns early for a cancelled task without notifying, so
