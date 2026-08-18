@@ -51,17 +51,18 @@ const DEFAULTS = {
     // which stops an autopilot run with reason "error" and leaves the session marked failed.
     // Reporting advice is not a session failure, so it must not be reported as one.
     //
-    // The cost is that this host renders none of the three levels in the app window, so the
-    // timeline copy is effectively write-only here. That is acceptable: advice reaches the agent
-    // by injection on its next tool call, and reaches the user through `adviceLog`. Raise this on
-    // a host that renders info, and note that `warning` is also non-terminal except for the
-    // host's two reserved warning types.
+    // Whether any of this reaches the user's window is the app's business, not this code's:
+    // these banners rendered until mid-August 2026 and then stopped, with no change on either
+    // side. So treat rendering as something to re-check rather than a property to rely on. What
+    // does not depend on it: advice reaches the agent by injection on its next tool call, and
+    // both `adviceLog` and the session transcript record it. `warning` is also non-terminal,
+    // except for the host's two reserved warning types.
     //
-    // `{ ephemeral: true }` is not the missing ingredient, and has been tried: this host renders
-    // extension output only during extension init, which is why the startup banner below is the
-    // one message that ever shows. Measured after a reload and from a live turn — nothing
-    // appeared either way, with or without the flag. The flag looks decisive only because the
-    // sole call that passes it is also the sole call made during init.
+    // Do not reach for `{ ephemeral: true }` when nothing appears. It is the obvious candidate,
+    // it does not restore rendering, and it is actively harmful: an ephemeral log is not
+    // persisted, so it writes no `session.info` event into the transcript — destroying the one
+    // read-back channel that still works while rendering is broken. Measured both ways on the
+    // same forced `report()` call; only the non-ephemeral one left a record.
     timelineLevel: "info",
     // Relative paths resolve against the CLI's log directory, so a shared config stays portable.
     debugLog: "advisor.log",
@@ -1195,10 +1196,12 @@ if (adviceLogPath) {
     }
 }
 
+// Not ephemeral: an ephemeral log is not persisted, so it leaves no `session.info` event in the
+// transcript. That flag is why this banner is the only advisor message absent from the session's
+// event log — see the `timelineLevel` comment.
 await session.log(
     `advisor ready — ${cfg("model") ?? "agent default"} every ${cfg("everyNToolCalls")} tool calls` +
         `${adviceLogPath ? `\nadvice log: ${adviceLogPath}  (/advisor-log to read)` : ""}`,
-    { ephemeral: true },
 );
 
 // A rejected config value silently changes behaviour, so say so once at startup.

@@ -240,10 +240,12 @@ configured cadence immediately. `/advisor` shows the live interval and quiet str
 
 Advice is delivered into the agent's context, where you cannot see it. Two things make it visible:
 
-- **The timeline.** Each piece of advice is logged with a banner, at `info` level. Be aware that
-  this host currently renders *no* level of extension log in the app window, so the timeline copy
-  is effectively write-only here — use the advice log below. `timelineLevel` deliberately does not
-  default to `error`: see [Advice is not a session failure](#advice-is-not-a-session-failure).
+- **The timeline.** Each piece of advice is logged with a banner, at `info` level. Whether the app
+  renders it is currently a regression rather than a design property — see
+  [When advice does not appear in the window](#when-advice-does-not-appear-in-the-window). It is
+  recorded either way, as a `session.info` event in the session transcript. `timelineLevel`
+  deliberately does not default to `error`: see
+  [Advice is not a session failure](#advice-is-not-a-session-failure).
 - **The advice log.** A human-readable record of every outcome: raised, injected, denied, dropped
   as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup.
 
@@ -272,29 +274,44 @@ the reason is reported at startup, because the terminal classification lives in 
 rather than in a host-specific display layer — so there is no host on which the setting is merely
 cosmetic, and an old config carrying it would silently break every session it advised.
 
-The trade is visibility. This host renders no level of extension log in the app window — measured,
-by emitting at all three — so nothing is lost by dropping to `info` here, and a session that keeps
-running is worth more than a banner that never appears. Advice still reaches the agent by
-injection on its next tool call, and reaches you through the advice log.
+The trade is not visibility. Dropping to `info` costs nothing, because the level was never what
+decided whether anything appeared.
 
-### `ephemeral: true` does not make it visible
+### When advice does not appear in the window
 
-It is the obvious next thing to try, and it has been tried. `session.log(msg, { ephemeral: true })`
-emitted after init produces nothing: no output from a live turn, none after an `extensions_reload`,
-and no throw. What renders is not decided by the level or by the flag — this host shows extension
-output **only during extension init**, which is why the startup banner is the one message that ever
-appears.
+At the time of writing it does not, and that is the app's doing rather than this extension's: these
+banners rendered until mid-August 2026 and then stopped, with no change on either side. Asaf
+confirms he used to see `ADVISOR · CONCERN` banners appear on their own. So this is a regression to
+wait out, not a property to design around — and the delivery path that matters never depended on it,
+because advice is injected into the agent's context on its next tool call.
 
-The flag is a tempting explanation because it correlates perfectly with visibility: the only call
-that passes it is also the only call made during init. Two dimensions moved together and only one
-of them mattered. Before concluding that some flag is what makes output appear, emit one message
-*after* init both with and without it — that single comparison is what separates the two.
+To check what is true now, rather than trusting this paragraph: emit a message and look, and grep
+the session transcript for what was recorded.
 
-The practical consequence is that this host has no passive user-visible channel at all. The
-complete set is the init banner and `session.ui` (`elicitation`, `confirm`, `select`, `input`),
-every one of which demands an answer. So injection into the agent's context is not advisor's
-fallback path; it is the only delivery mechanism that exists here, and the advice log is how a
-human reads back what was said.
+```powershell
+# every user-facing message this session recorded
+Select-String -Path "$env:USERPROFILE\.copilot\session-state\<session-id>\events.jsonl" `
+  -Pattern '"type":"session.info"'
+```
+
+### Do not reach for `ephemeral: true`
+
+It is the obvious candidate when nothing renders, both this extension and `self-learn` tried it, and
+it is worse than the problem. It does not restore rendering — and because an ephemeral log is
+explicitly *not persisted*, it writes no `session.info` event either, destroying the one read-back
+channel that still works while rendering is broken.
+
+Measured on the same forced `report()` call, non-ephemeral and ephemeral: only the non-ephemeral one
+left a `session.info` in `events.jsonl`. Across this repository's entire session history the only
+message that never appears in a transcript is the startup banner, which was the only call passing
+the flag.
+
+The flag is convincing because it correlates perfectly with visibility — the only call passing it
+was also the only call made during extension init, so two dimensions moved together and only one
+mattered. The general form of the mistake is worth more than this instance: when output is correct
+at every layer you control, suspect the layer you do not, and ask "did this ever work?" before
+asking "what did I break?". That question costs one sentence and would have redirected this
+investigation on day one.
 
 ## Prompt injection into the review transcript
 
