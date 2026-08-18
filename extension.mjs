@@ -8,6 +8,22 @@ import { readFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
 
+// This file cannot be imported by a test — it ends in a top-level `await joinSession(...)` — so
+// the pure logic lives in lib.mjs, where test.mjs can reach it.
+import {
+    SEVERITY_RANK,
+    settledEmptyPollLimit,
+    isFatalError,
+    truncate,
+    renderToolArgs,
+    validateConfig,
+    parseVerdict,
+    sanitizeNote,
+    formatAdvice,
+    formatTimelineAdvice,
+    downgradeUnfoundedUserClaim,
+} from "./lib.mjs";
+
 // The CLI's config directory can be relocated, so derive it rather than assuming ~/.copilot.
 const CONFIG_DIR = process.env.COPILOT_CONFIG_DIR || join(homedir(), ".copilot");
 const LOG_DIR = join(CONFIG_DIR, "logs");
@@ -46,20 +62,6 @@ const DEFAULTS = {
     instructions: "",
 };
 
-const SEVERITY_RANK = { none: 0, nit: 1, concern: 2, blocker: 3 };
-
-// A sub-agent can report "idle" before it has produced anything, so a settled-but-empty poll is
-// not proof of completion. Tolerate them for a fraction of the overall timeout rather than a
-// fixed count — a fixed 8 polls capped every review at 16s and made `timeoutMs` unreachable.
-const SETTLED_EMPTY_GRACE_FRACTION = 0.25;
-const MIN_SETTLED_EMPTY_POLLS = 8;
-
-function settledEmptyPollLimit() {
-    const interval = Math.max(cfg("pollIntervalMs"), 1);
-    const grace = cfg("timeoutMs") * SETTLED_EMPTY_GRACE_FRACTION;
-    return Math.max(MIN_SETTLED_EMPTY_POLLS, Math.ceil(grace / interval));
-}
-
 // `tasks.startAgent` accepts only these built-in agent types. Custom agents defined on disk are
 // not dispatchable through it, so the advisor cannot use one to pin its own reasoning effort.
 const BUILTIN_AGENT_TYPES = [
@@ -71,18 +73,6 @@ const BUILTIN_AGENT_TYPES = [
     "research",
     "security-review",
 ];
-
-// Failures that will recur identically on every future review. Retrying them wastes a sub-agent
-// dispatch per cadence interval and repeats the same error, so the advisor stands itself down.
-const FATAL_ERROR_PATTERNS = [
-    /agent executors are not available/i,
-    /unknown agent type/i,
-    /startAgent unavailable/i,
-];
-
-function isFatalError(message) {
-    return FATAL_ERROR_PATTERNS.some((pattern) => pattern.test(message ?? ""));
-}
 
 // Separates advice entries in the log. A visible marker is unsafe: advice text may itself contain
 // a markdown heading at line start. U+001E (record separator) is guaranteed absent from notes
@@ -109,66 +99,6 @@ const USER_PROMPT_HISTORY_LIMIT = 40;
 // Upper bound on cancelling and removing a finished review task.
 const DISPOSE_TIMEOUT_MS = 5000;
 
-// Minimum sane values for numeric keys. A zero or negative interval would dispatch a review on
-// every tool call or busy-loop the poller, and a bad value currently fails in confusing ways
-// rather than loudly.
-const NUMERIC_FLOORS = {
-    everyNToolCalls: 1,
-    immuneToolCalls: 0,
-    maxBackoffFactor: 1,
-    maxAdviceAgeMs: 0,
-    maxTranscriptChars: 500,
-    maxToolResultChars: 100,
-    timeoutMs: 5000,
-    pollIntervalMs: 250,
-};
-
-const LOG_LEVELS = ["info", "warning", "error"];
-
-// Rejected values fall back to the default rather than propagating. Reasons are returned so the
-// user can be told once, at startup, instead of silently getting different behaviour.
-function validateConfig(raw) {
-    const clean = { ...raw };
-    const problems = [];
-
-    for (const [key, floor] of Object.entries(NUMERIC_FLOORS)) {
-        const value = clean[key];
-        if (typeof value === "number" && Number.isFinite(value) && value >= floor) continue;
-        problems.push(`${key}=${JSON.stringify(value)} (must be a number >= ${floor})`);
-        clean[key] = DEFAULTS[key];
-    }
-
-    if (!(clean.minSeverityToInject in SEVERITY_RANK)) {
-        problems.push(
-            `minSeverityToInject=${JSON.stringify(clean.minSeverityToInject)}` +
-                ` (must be one of ${Object.keys(SEVERITY_RANK).join(", ")})`,
-        );
-        clean.minSeverityToInject = DEFAULTS.minSeverityToInject;
-    }
-
-    if (!LOG_LEVELS.includes(clean.timelineLevel)) {
-        problems.push(
-            `timelineLevel=${JSON.stringify(clean.timelineLevel)}` +
-                ` (must be one of ${LOG_LEVELS.join(", ")})`,
-        );
-        clean.timelineLevel = DEFAULTS.timelineLevel;
-    } else if (clean.timelineLevel === "error") {
-        // Not a taste question. An extension log at error level is a `session.error`, which the
-        // CLI classifies as a terminal fault and uses to stop autopilot and fail the session, so
-        // honouring this setting would break the very session it is advising. The check lives
-        // here rather than in LOG_LEVELS so the reason is reported instead of a bare "invalid".
-        problems.push(
-            'timelineLevel="error" is not supported: the CLI treats an error-level extension log' +
-                " as a terminal session failure, which stops autopilot and marks the session" +
-                ` failed. Using "${DEFAULTS.timelineLevel}" instead.`,
-        );
-        clean.timelineLevel = DEFAULTS.timelineLevel;
-    }
-
-    clean._problems = problems;
-    return clean;
-}
-
 function loadConfig(workingDirectory) {
     const candidates = [
         process.env.COPILOT_ADVISOR_CONFIG,
@@ -180,7 +110,10 @@ function loadConfig(workingDirectory) {
         try {
             if (!existsSync(path)) continue;
             const parsed = JSON.parse(readFileSync(path, "utf8"));
-            return { ...validateConfig({ ...DEFAULTS, ...parsed }), _configPath: path };
+            return {
+                ...validateConfig({ ...DEFAULTS, ...parsed }, DEFAULTS),
+                _configPath: path,
+            };
         } catch (err) {
             // A malformed config must not take the extension down, but it must not be silent
             // either — the user gets default behaviour and no explanation otherwise.
@@ -260,42 +193,6 @@ function recordAdvice(severity, note, outcome) {
     } catch {
         // Never break the review loop over logging.
     }
-}
-
-function truncate(text, limit) {
-    const str = typeof text === "string" ? text : JSON.stringify(text ?? "");
-    if (str.length <= limit) return str;
-    return `${str.slice(0, limit)}\n…[truncated ${str.length - limit} chars]`;
-}
-
-// Tool arguments that carry instructions to another agent rather than data. Inlined verbatim
-// into the review transcript, their contents are indistinguishable in authority from the user's
-// own words, and an advisor has been observed adopting a probe sub-agent's prompt as "the user's
-// requirement" and issuing a blocker on that basis.
-//
-// Deliberately narrow: `prompt` and `message` are near-universally instructions, whereas `body`,
-// `content` and `file_text` are data the reviewer needs to do its job.
-const INSTRUCTION_ARG_FIELDS = new Set(["prompt", "message"]);
-
-function renderToolArgs(args, limit = 600) {
-    let obj = args;
-    if (typeof args === "string") {
-        try {
-            obj = JSON.parse(args);
-        } catch {
-            return truncate(args, limit);
-        }
-    }
-    if (!obj || typeof obj !== "object") return truncate(obj, limit);
-
-    const safe = {};
-    for (const [key, value] of Object.entries(obj)) {
-        safe[key] =
-            INSTRUCTION_ARG_FIELDS.has(key) && typeof value === "string"
-                ? `[instruction text omitted, ${value.length} chars]`
-                : value;
-    }
-    return truncate(safe, limit);
 }
 
 function renderEvent(event) {
@@ -575,91 +472,6 @@ or has already gone off the rails. This WILL interrupt it, so use it sparingly.
 functions, or requirements.${extra ? `\n\nAdditional project-specific instructions:\n${extra}` : ""}`;
 }
 
-// Extracts balanced {...} spans, respecting string literals and escapes. A naive non-greedy
-// regex stops at the first "}", so any note mentioning code — `else { }`, `${VAR}`, a regex —
-// truncates into invalid JSON and the whole verdict is lost.
-function balancedJsonCandidates(text) {
-    const candidates = [];
-    let depth = 0;
-    let start = -1;
-    let inString = false;
-    let escaped = false;
-
-    for (let i = 0; i < text.length; i++) {
-        const ch = text[i];
-
-        if (inString) {
-            if (escaped) escaped = false;
-            else if (ch === "\\") escaped = true;
-            else if (ch === '"') inString = false;
-            continue;
-        }
-
-        if (ch === '"') inString = true;
-        else if (ch === "{") {
-            if (depth === 0) start = i;
-            depth++;
-        } else if (ch === "}" && depth > 0) {
-            depth--;
-            if (depth === 0) candidates.push(text.slice(start, i + 1));
-        }
-    }
-    return candidates;
-}
-
-// Returned when the reply could not be understood at all. Distinct from a genuine "none" so the
-// caller never mistakes a parse failure for a clean review.
-const UNPARSEABLE = { severity: "none", note: "", unparseable: true };
-
-function parseVerdict(raw) {
-    if (!raw || typeof raw !== "string") return { severity: "none", note: "" };
-
-    // The advisor may wrap its JSON in prose or a fenced block; take the last object that parses.
-    const candidates = balancedJsonCandidates(raw);
-    if (candidates.length === 0) return UNPARSEABLE;
-
-    for (const candidate of candidates.reverse()) {
-        try {
-            const parsed = JSON.parse(candidate);
-            if (typeof parsed?.severity !== "string") continue;
-            const severity = parsed.severity.toLowerCase();
-            if (!(severity in SEVERITY_RANK)) continue;
-            return { severity, note: sanitizeNote(parsed.note) };
-        } catch {
-            // Not the JSON we want; keep looking.
-        }
-    }
-    return UNPARSEABLE;
-}
-
-// The advisor's output flows into the main agent's context, so treat it as untrusted text. The
-// note is interpolated between real <advisor> delimiters, so angle brackets are escaped rather
-// than pattern-stripped — a note cannot then forge a tag of any shape.
-function sanitizeNote(note) {
-    if (typeof note !== "string") return "";
-    const clean = note
-        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, " ")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .trim();
-    return clean.slice(0, 800);
-}
-
-function formatAdvice(advice) {
-    return `<advisor severity="${advice.severity}">
-${advice.note}
-</advisor>
-The above is from an independent reviewer model watching your work. It cannot see your full \
-context and may be wrong — weigh it against what you know. If it is wrong, say so briefly and continue.`;
-}
-
-// Only error-level logs render, and they render quietly, so the message itself has to carry the
-// emphasis. The banner makes advice findable when scrolling back through a long session.
-function formatTimelineAdvice(advice, suffix = "") {
-    const bar = "━".repeat(18);
-    return `${bar} ⚠  ADVISOR · ${advice.severity.toUpperCase()}${suffix} ${bar}\n${advice.note}`;
-}
-
 async function runAdvisorAgent(session, prompt) {
     const rpc = session.rpc;
     if (!rpc?.tasks?.startAgent) throw new Error("session.rpc.tasks.startAgent unavailable");
@@ -805,7 +617,10 @@ async function runAdvisorAgent(session, prompt) {
             // "finished". Only give up once it has been settled without a reply for a while —
             // and treat that as an error, never as a clean review.
             if (task.status === "completed" || task.status === "idle") {
-                if (++emptySettledPolls >= settledEmptyPollLimit()) {
+                if (
+                    ++emptySettledPolls >=
+                    settledEmptyPollLimit(cfg("pollIntervalMs"), cfg("timeoutMs"))
+                ) {
                     await dumpEventDiagnostics(session, baseline);
                     throw new Error(
                         `advisor agent settled without producing a reply after ` +
@@ -883,40 +698,6 @@ async function readAgentReplyFromEventLog(session, toolCallId, baseline) {
 
     debug(`recovered reply for ${internalId} from event log (${replies.length} message(s))`);
     return { status: "done", reply: replies[replies.length - 1], completed };
-}
-
-// The advisor can only learn what the user asked for through the transcript, so a verdict that
-// rests on a claimed user requirement is exactly the case most likely to be a misreading of some
-// instruction-shaped text. A blocker halts real work immediately, so it has to be earned: the
-// prompt requires such a blocker to quote the user verbatim, and an unquoted or uncorroborated
-// claim is downgraded.
-//
-// This deliberately errs toward downgrading. A downgraded verdict is still delivered in full as a
-// concern — only the tool-call denial is withheld — so a false negative costs far less than a
-// false blocker halting real work on an imagined requirement.
-const USER_CLAIM_PATTERN =
-    /\b(?:the\s+)?user(?:'s|s)?\s+(?:\w+ly\s+|explicit\s+|stated\s+|clear\s+)?(?:require|requirement|request|asked|ask|said|says|instruct|specified|wants?|demanded|told)/i;
-
-function downgradeUnfoundedUserClaim(advice) {
-    if (advice.severity !== "blocker") return;
-    if (!USER_CLAIM_PATTERN.test(advice.note)) return;
-
-    // Corroborate against every user prompt in the session, not just the current one: a follow-up
-    // like "continue" would otherwise discard the requirement an earlier prompt established and
-    // downgrade a legitimate blocker. Only real user prompts are trusted here — the transcript is
-    // the untrusted surface.
-    const trusted = state.userPrompts.join("\n").toLowerCase();
-    const quoted = [...advice.note.matchAll(/[`"']([^`"']{8,80})[`"']/g)].map((m) =>
-        m[1].toLowerCase(),
-    );
-    if (quoted.some((q) => trusted.includes(q))) return;
-
-    debug(`downgrading blocker to concern: uncorroborated user-requirement claim`);
-    advice.severity = "concern";
-    advice.note =
-        `${advice.note}\n\n[advisor: downgraded from blocker — this asserts a user requirement ` +
-        `that could not be corroborated against the recorded goal, so it may be a misreading of ` +
-        `instruction-shaped text in the transcript.]`;
 }
 
 // Emitted once when a review yields nothing, so an unexpected event shape can be diagnosed
@@ -998,7 +779,9 @@ async function runCheck(session, { force = false } = {}) {
             throw new Error(`advisor reply could not be parsed: ${truncate(raw, 200)}`);
         }
 
-        downgradeUnfoundedUserClaim(advice);
+        if (downgradeUnfoundedUserClaim(advice, state.userPrompts)) {
+            debug(`downgrading blocker to concern: uncorroborated user-requirement claim`);
+        }
 
         if (advice.severity === "none" || !advice.note) {
             state.consecutiveQuietChecks++;

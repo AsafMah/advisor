@@ -304,16 +304,27 @@ are now attributed to an agent before they are acted on — see "Only the main a
 ## Development
 
 ```
+npm test                              # unit tests for lib.mjs (node --test)
 node --check extension.mjs            # syntax
-node scripts/test-parse.mjs           # verdict parsing and note sanitisation
 node scripts/check-config-keys.mjs    # DEFAULTS vs example vs README table
 node scripts/check-config-usage.mjs   # every cfg() key declared, every key used
 ```
 
-The parsing tests matter more than their size suggests: they cover the path that turns untrusted
-model output into a decision that can block a tool call. A real bug lived there — a non-greedy
-regex meant any note mentioning code truncated into invalid JSON and the verdict was silently
-discarded as "no concerns".
+`extension.mjs` exports nothing and ends in a top-level `await joinSession(...)`, so a test can
+never import it — importing would join a session rather than run assertions. Anything carrying a
+real invariant therefore lives in `lib.mjs`, which is pure: no session, no rpc, no module state,
+no config lookups. Values those functions need are passed in by the caller.
+
+`DEFAULTS` deliberately stays in `extension.mjs`. Both config check scripts locate it there by
+text, as they do every `cfg("key")` call site, so moving it would silently disable the parity
+checks rather than fail them.
+
+The tests matter more than their size suggests: they cover the path that turns untrusted model
+output into a decision that can block a tool call. A real bug lived there — a non-greedy regex
+meant any note mentioning code truncated into invalid JSON and the verdict was silently discarded
+as "no concerns". `parseVerdict` also doubles as the recogniser that cancels the review sub-agent
+before the host announces it, so its shape-specificity is pinned by tests: a reply that is valid
+JSON but not a verdict must not be accepted.
 
 ## Design notes
 
