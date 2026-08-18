@@ -22,6 +22,7 @@ import {
     sanitizeNote,
     formatAdvice,
     formatTimelineAdvice,
+    isMainAgentStop,
     downgradeUnfoundedUserClaim,
     USER_CLAIM_PATTERN,
 } from "./lib.mjs";
@@ -548,6 +549,43 @@ test("validateConfig", async (t) => {
         validateConfig(raw, DEFAULTS);
         assert.equal(raw.everyNToolCalls, 0);
         assert.equal(raw._problems, undefined);
+    });
+});
+
+test("isMainAgentStop", async (t) => {
+    const MAIN = "5eec87ee-9591-45a0-a046-61deb374ed2a";
+
+    await t.test("the main agent's own stop is recognised", () => {
+        assert.equal(isMainAgentStop({ sessionId: MAIN }, MAIN), true);
+    });
+
+    // Measured on 1.0.80: a `task` sub-agent's stop carries its toolCallId, an RPC-started one
+    // carries bg-<uuid>. Both must be rejected, or the advisor holds a sub-agent's turn open over
+    // advice written about the main agent — including its own review sub-agent's turn.
+    await t.test("a task sub-agent's stop is rejected", () => {
+        assert.equal(isMainAgentStop({ sessionId: "toolu_01CpQs6FRexSmdhxMMarHNZv" }, MAIN), false);
+    });
+
+    await t.test("an rpc sub-agent's stop is rejected", () => {
+        assert.equal(
+            isMainAgentStop({ sessionId: "bg-a6365553-0b55-4032-96cd-6fcb6506f22c" }, MAIN),
+            false,
+        );
+    });
+
+    // Fail closed: an unrecognisable id must never be treated as the main agent.
+    await t.test("missing or malformed ids are rejected", () => {
+        assert.equal(isMainAgentStop({}, MAIN), false);
+        assert.equal(isMainAgentStop(null, MAIN), false);
+        assert.equal(isMainAgentStop({ sessionId: "" }, MAIN), false);
+        assert.equal(isMainAgentStop({ sessionId: 42 }, MAIN), false);
+    });
+
+    // An empty main session id must not make everything match.
+    await t.test("an unknown main session id rejects everything", () => {
+        assert.equal(isMainAgentStop({ sessionId: "" }, ""), false);
+        assert.equal(isMainAgentStop({ sessionId: MAIN }, ""), false);
+        assert.equal(isMainAgentStop({ sessionId: MAIN }, undefined), false);
     });
 });
 

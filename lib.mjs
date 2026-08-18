@@ -207,6 +207,26 @@ export function sanitizeNote(note) {
     return clean.slice(0, 800);
 }
 
+// `onAgentStop` fires for sub-agents too, contradicting the SDK's own comment that "for
+// sub-agents, the runtime fires a separate sub-agent stop lifecycle". Measured on 1.0.80: a
+// sub-agent's stop arrives with `input.sessionId` set to that sub-agent's own id — the `task`
+// tool's toolCallId, or a `bg-<uuid>` for an RPC-started agent — while `invocation.sessionId`
+// stays the main session's either way. So the sub-agent id is never equal to the main session id,
+// and comparing against it is the discriminator.
+//
+// This is a different mechanism from the hook-dispatch matching used for the tool-use hooks: those
+// carry no agent identity at all, whereas a stop does.
+//
+// Unknown ids are treated as NOT the main agent. Advisor's advice is written about the main
+// agent's work, so mis-attributing a stop would hold a sub-agent's turn open over advice it can
+// neither see nor act on.
+export function isMainAgentStop(input, mainSessionId) {
+    const id = input?.sessionId;
+    if (typeof id !== "string" || id === "") return false;
+    if (typeof mainSessionId !== "string" || mainSessionId === "") return false;
+    return id === mainSessionId;
+}
+
 export function formatAdvice(advice) {
     return `<advisor severity="${advice.severity}">
 ${advice.note}

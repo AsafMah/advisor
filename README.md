@@ -82,6 +82,15 @@ So a blocker is a loud, disruptive way to make the agent stop and read a note. I
 Advice older than `maxAdviceAgeMs` is discarded rather than delivered, which limits the damage
 but does not make delivery causally aligned with the reviewed action.
 
+One gap this leaves: an agent that stops working makes no next tool call, so a blocker found at
+the end of a turn used to be written to the timeline as `UNDELIVERED` and never acted on. A
+pending blocker now also holds the turn open via the agent-stop hook, which enqueues it as a
+follow-up so the agent addresses it before finishing. This starts no review and computes nothing
+new — it only delivers advice that already exists, so it costs no latency. Only `blocker` does
+this; concerns and nits keep their previous behaviour, and `blockOnBlocker: false` disables it
+along with the tool-call denial. The runtime caps consecutive blocks, and the advisor declines to
+block on a re-entry from its own previous block, so it cannot hold a turn open indefinitely.
+
 Treat `blockOnBlocker` as "interrupt me hard", not as a safety control. If you want advice
 without the disruption, set it to `false` and blockers inject as context like everything else.
 
@@ -349,6 +358,15 @@ JSON but not a verdict must not be accepted.
   user's goal, counts its own file reads as the main agent working, and delivers advice about the
   main agent into a sub-agent that cannot act on it. None of this stands the advisor down while a
   sub-agent runs: advice stays pending and is delivered on the main agent's next tool call.
+
+  The agent-stop hook is the exception that needs a different mechanism, because it *does* carry
+  identity — and it fires for sub-agents despite an SDK comment saying they get a separate
+  lifecycle. Measured on 1.0.80: a sub-agent's stop arrives with `input.sessionId` set to that
+  sub-agent's own id (the `task` tool's `toolCallId`, or `bg-<uuid>` for an RPC-started agent,
+  which is what the advisor's own review agent is) while `invocation.sessionId` stays the main
+  session's. Comparing the two is the discriminator, and it fails closed on an unrecognisable id.
+  Without it the advisor's own review sub-agent would trigger a stop review, which would start
+  another review — the same recursion the `agentId` filtering above exists to prevent.
 - **Untrusted output.** The advisor's note is injected into the main agent's context and can deny
   a tool call, so it is stripped of control characters, has angle brackets escaped so it cannot
   forge a structural tag, and is capped at 800 characters. It is wrapped in an `<advisor>` block

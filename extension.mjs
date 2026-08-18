@@ -21,6 +21,7 @@ import {
     sanitizeNote,
     formatAdvice,
     formatTimelineAdvice,
+    isMainAgentStop,
     downgradeUnfoundedUserClaim,
 } from "./lib.mjs";
 
@@ -947,6 +948,47 @@ const session = await joinSession({
             debug(`delivering ${advice.severity} as context: ${advice.note}`);
             recordAdvice(advice.severity, advice.note, `injected before: ${input?.toolName}`);
             return { additionalContext: formatAdvice(advice) };
+        },
+
+        // Advice is normally delivered on the next tool call. An agent that simply stops working
+        // makes no next tool call, so a blocker found at the end of a turn was only ever written
+        // to the timeline as UNDELIVERED — the agent had already finished and never acted on it.
+        // Holding the turn open is the one mechanism the runtime offers for making it act.
+        //
+        // Deliberately narrow: only a pending `blocker` blocks. Concerns and nits keep their
+        // existing behaviour, so this adds no new interruption at any severity that did not
+        // already interrupt via `permissionDecision: "deny"`. No review is started here either —
+        // this delivers advice that has already been computed, so it costs no latency.
+        onAgentStop: async (input, invocation) => {
+            // Compared against `invocation.sessionId` rather than the `session` binding: hooks are
+            // declared inside the `joinSession` call that initialises `session`, so closing over
+            // it would be a temporal-dead-zone reference that only works because hooks happen to
+            // fire later. The invocation carries the main session id directly.
+            if (!isMainAgentStop(input, invocation?.sessionId)) return;
+
+            // A re-entry after a previous block. The runtime caps consecutive blocks, but spending
+            // that budget to re-raise advice the agent is already acting on would only delay it.
+            if (input?.stopHookActive) return;
+
+            // Blocking while a prompt is open would answer a question the user is being asked.
+            if (awaitingUser()) return;
+
+            debug(`main-agent stop: pending=${state.pendingAdvice?.severity ?? "none"}`);
+
+            // Checked before consuming: anything that is not a blocker we are willing to act on
+            // must stay pending for the existing idle flush, not be silently swallowed here.
+            if (state.pendingAdvice?.severity !== "blocker" || !cfg("blockOnBlocker")) return;
+
+            // Applies the staleness check, and so may still decline to return the advice.
+            const advice = takePendingAdvice();
+            if (advice?.severity !== "blocker") return;
+
+            debug(`blocking agent stop on pending blocker: ${advice.note}`);
+            recordAdvice(advice.severity, advice.note, "blocked agent stop");
+            // Enqueued as a user message by the runtime, so the framing in formatAdvice — an
+            // independent reviewer that may be wrong — is what stops it reading as the user's
+            // own instruction.
+            return { decision: "block", reason: formatAdvice(advice) };
         },
     },
 
