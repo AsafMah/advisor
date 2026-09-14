@@ -361,9 +361,22 @@ Layer 3 depends on the record of user prompts being genuinely the user's. It was
 opening prompt is dispatched to `onUserPromptSubmitted` like any other, so every `task` sub-agent's
 brief — and the advisor's own review prompt, which embeds the whole transcript — was being recorded
 as something the user had said. That both replaced the goal under review and let arbitrary
-transcript text corroborate a blocker claiming to quote the user. Observed in the wild: the advisor
-denied a main-agent tool call over a "user requirement" that was a sub-agent's task prompt. Hooks
-are now attributed to an agent before they are acted on — see "Only the main agent is watched".
+transcript text corroborate a blocker claiming to quote the user. Observed in the wild repeatedly:
+the advisor denies a main-agent tool call over a "user requirement" that is a sub-agent's task
+prompt, including against the very session writing this paragraph.
+
+The first attempt at a guard resolved the hook's caller from the `hook.start` bracket around it, as
+`onPreToolUse` does. That guard was dead on arrival and stayed dead for a month: measured on
+1.0.84-5, the bracket for `userPromptSubmitted` carries no `agentId` at all — unlike every other
+hook — so the check could never be satisfied and every prompt fell through as the main agent's. To
+confirm the guard is live rather than merely present, grep an episode log for `ignoring sub-agent
+prompt` in a session where a `task` sub-agent ran; a guard that is working leaves a line there.
+
+Prompts are therefore classified from the `user.message` **event**, which does carry `agentId`,
+rather than from a hook. Correlating the hook to its event was rejected on measurement, not taste:
+the event arrives ~273 ms after the hook is entered, so any bounded wait is a race that fails open
+under load — the precise failure being fixed. The event path has no window to lose. See
+`classifyPrompt` in `lib.mjs` for what each provenance grants.
 
 ## Development
 
@@ -393,7 +406,30 @@ JSON but not a verdict must not be accepted.
 ## Design notes
 
 - **Non-blocking.** The review runs as a detached background task; the main agent never waits.
-  Advice lands on the next tool call after the advisor finishes.
+  Advice lands on the next tool call after the advisor finishes, delivered two ways for two
+  different reasons:
+  - `onPreToolUse` returns it as `additionalContext` *before* a tool runs, so a `blocker` can also
+    deny the call. This is the enforcement path.
+  - `onPostToolUse` returns it as `additionalContext` *after* a tool runs. There is no
+    `permissionDecision` to withhold at that point, so this path deliberately declines blockers
+    while `blockOnBlocker` is on: consuming one here would retire the denial the setting promises.
+    It exists so advice that arrives with no further tool call to carry it still reaches the agent
+    inside the turn, correctly attributed, instead of waiting for the stop boundary.
+
+  Both are attributed to the hook, not to the user. The stop boundary is not — see below.
+- **Advice at a stop boundary is attributed to the user, and that is a host limitation.** When a
+  `blocker` is still pending as the agent stops, `onAgentStop` returns `{decision: "block",
+  reason}`, and the host re-delivers that `reason` into the session as a queued `user.message`
+  containing the advisor's words verbatim. The agent receives its reviewer's opinion as though the
+  user had typed it. This is not a workaround the extension chose: `AgentStopHookOutput` accepts
+  only `decision` and `reason` and has no `additionalContext` field, and `session.send` has no
+  source or attribution option, so no supported mechanism reaches an agent at its stop boundary
+  without a synthetic user turn. Keeping the block — accepting the attribution rather than losing
+  end-of-turn enforcement — is a deliberate decision. Two things contain the damage: `formatAdvice`
+  opens with an `<advisor>` element naming an independent reviewer that may be wrong, and
+  `classifyPrompt` recognises that element on the way back in, so the advisor never treats its own
+  returned text as evidence of what the user wants. Remove the block when a stop hook can return
+  `additionalContext`.
 - **Reply recovery.** The reply is read in order of reliability: `task.result`, then
   `task.latestResponse`, then the session event log. The first two are keyed by the task id the
   extension owns, so they cannot bind to a foreign agent. The event-log fallback exists because
@@ -404,12 +440,14 @@ JSON but not a verdict must not be accepted.
   guessing by model or by "first agent after my baseline" will eventually bind to another
   extension's sub-agent and parse its output as a verdict.
 - **Only the main agent is watched.** Sub-agent events carry an `agentId`; main-agent events do
-  not. Every trigger path filters on it: the transcript, the in-flight set, and the tool-call
-  counter that drives the cadence. Extension hooks need more work, because they are dispatched for
-  sub-agents too and their payload carries no agent identity — the `invocation` argument holds
-  only `sessionId`. The event log brackets each hook dispatch in `hook.start`/`hook.end` events
-  that *do* carry `agentId`, so `onUserPromptSubmitted` and `onPreToolUse` resolve their caller
-  from the bracket open around them. Without this the advisor reads its own review prompt as the
+  not. Every trigger path filters on it: the transcript, the in-flight set, the tool-call
+  counter that drives the cadence, and prompt classification. Extension hooks need more work,
+  because they are dispatched for sub-agents too and their payload carries no agent identity — the
+  `invocation` argument holds only `sessionId`. The event log brackets each hook dispatch in
+  `hook.start`/`hook.end` events that *do* carry `agentId`, so `onPreToolUse` and `onPostToolUse`
+  resolve their caller from the bracket open around them. This does **not** work for every hook:
+  the `userPromptSubmitted` bracket carries no `agentId`, which is why prompts are classified from
+  the `user.message` event instead. Without all this the advisor reads its own review prompt as the
   user's goal, counts its own file reads as the main agent working, and delivers advice about the
   main agent into a sub-agent that cannot act on it. None of this stands the advisor down while a
   sub-agent runs: advice stays pending and is delivered on the main agent's next tool call.

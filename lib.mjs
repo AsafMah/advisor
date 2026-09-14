@@ -279,3 +279,60 @@ export function downgradeUnfoundedUserClaim(advice, userPrompts = []) {
         `instruction-shaped text in the transcript.]`;
     return true;
 }
+
+// Every prompt that drives the main session arrives as a `user.message` event, and that event is
+// the only place the prompt's provenance is recorded. The hook that also reports prompts
+// (`onUserPromptSubmitted`) carries no agent identity at all — measured on host 1.0.84-5, a
+// sub-agent's opening prompt reaches it with `agentId` and `parentToolCallId` both null, unlike
+// the tool-use hooks — so a sub-agent's task prompt is indistinguishable there from something the
+// user typed. Classifying from the event instead is the same move `countToolCall` already makes,
+// and for the same reason.
+//
+// Two independent questions are answered here, and conflating them is the bug this replaced:
+//
+//   owner       — main session or sub-agent. A sub-agent prompt is not this session's turn at all.
+//   authority   — whether the text is evidence of something *the user* asked for.
+//
+// They are not the same axis. A cross-session message from an operator session is a legitimate
+// instruction that should steer the work, but it is not the user speaking; neither is the
+// `<advisor>` follow-up the host enqueues when `onAgentStop` blocks, which is the advisor's own
+// words being handed back to it. Treating either as user evidence lets the advisor corroborate a
+// blocker against text it produced — see `downgradeUnfoundedUserClaim`, whose whole defence is
+// that `userPrompts` contains only what the user actually said.
+export const PROMPT_OWNER_MAIN = "main";
+export const PROMPT_OWNER_SUB_AGENT = "sub-agent";
+
+// The host re-delivers a blocked stop as a user message whose body is exactly `formatAdvice`'s
+// output, so the opening tag identifies it without needing to match the note itself. Checked on
+// the raw text rather than on `source`, because it must hold even for a prompt that arrived with
+// no event to classify.
+export function isAdvisorFollowUp(text) {
+    return typeof text === "string" && /^\s*<advisor\b/.test(text);
+}
+
+// `record` is the `user.message` event's payload, or null when a prompt could not be attributed.
+// Absence is deliberately treated as an ordinary user prompt: that is the behaviour every release
+// before this one had, so an unattributed prompt is no worse off than it used to be, while the
+// `<advisor>` check above still applies because it needs no attribution.
+export function classifyPrompt(record) {
+    const content = typeof record?.content === "string" ? record.content : "";
+
+    // Presence, never a prefix: sub-agent ids appear both as bare UUIDs and with a `bg-` prefix
+    // depending on how the agent was started, and matching the shape would miss one of them.
+    if (record?.agentId) {
+        return { owner: PROMPT_OWNER_SUB_AGENT, isUserAuthored: false, setsGoal: false, reason: "sub-agent" };
+    }
+    if (isAdvisorFollowUp(content)) {
+        // Must not become the goal either: it would overwrite the real objective with the
+        // advisor's own critique of it.
+        return { owner: PROMPT_OWNER_MAIN, isUserAuthored: false, setsGoal: false, reason: "advisor-follow-up" };
+    }
+    // Set on messages the host did not receive from the user: `system` for injections, and
+    // `agent-<session-id>` for a message sent by another session. Deliberately not used to decide
+    // ownership — a cross-session message from an operator carries a source but is a genuine
+    // instruction to this session, and ignoring it would make the advisor deaf to its own operator.
+    if (typeof record?.source === "string" && record.source) {
+        return { owner: PROMPT_OWNER_MAIN, isUserAuthored: false, setsGoal: true, reason: `source:${record.source}` };
+    }
+    return { owner: PROMPT_OWNER_MAIN, isUserAuthored: true, setsGoal: true, reason: "user" };
+}

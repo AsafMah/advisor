@@ -23,6 +23,8 @@ import {
     formatTimelineAdvice,
     isMainAgentStop,
     downgradeUnfoundedUserClaim,
+    classifyPrompt,
+    PROMPT_OWNER_SUB_AGENT,
 } from "./lib.mjs";
 
 // The CLI's config directory can be relocated, so derive it rather than assuming ~/.copilot.
@@ -326,8 +328,21 @@ function collectInFlight() {
 // carry `agentId`, correlated by `hookInvocationId`. `hook.start` reaches the extension before
 // the handler runs and `hook.end` only after it returns, so a handler can ask which agent it is
 // running for by looking at the bracket that is open around it.
-const HOOK_USER_PROMPT_SUBMITTED = "userPromptSubmitted";
+//
+// This works for the tool-use hooks and only for those. Measured on host 1.0.84-5, with a real
+// `task` sub-agent:
+//
+//   hook                              agentId    parentToolCallId
+//   preToolUse   (sub-agent tool)     set        set
+//   postToolUse  (sub-agent tool)     set        set
+//   userPromptSubmitted (sub-agent)   null       null
+//
+// A sub-agent's opening prompt is therefore unattributable at the hook, which is why prompts are
+// classified from the `user.message` event instead — see `handleUserMessage`. Re-run the check
+// before relying on the prompt bracket again: if the last column ever fills in, this comment is
+// what is out of date, not the code.
 const HOOK_PRE_TOOL_USE = "preToolUse";
+const HOOK_POST_TOOL_USE = "postToolUse";
 
 // A bracket whose end is somehow never seen would otherwise sit open forever.
 const MAX_OPEN_HOOK_DISPATCHES = 64;
@@ -878,43 +893,38 @@ function takePendingAdvice() {
     return advice;
 }
 
+// Split out of the hook so the ordering is explicit: every reason to decline is checked before
+// `takePendingAdvice` is called, because that call consumes. Getting this backwards would drop
+// advice on the floor for a sub-agent's tool call.
+async function takeAdviceForPostToolUse(input) {
+    // A blocker is enforcement, not commentary. Delivering one here would consume it without
+    // denying anything, so it is left pending for `onPreToolUse` to deny or `onAgentStop` to
+    // block. When `blockOnBlocker` is off there is no denial to preserve and it travels like any
+    // other note. Checked before consuming, and on the pending value rather than a taken one.
+    const pending = state.pendingAdvice;
+    if (!pending) return null;
+    if (pending.severity === "blocker" && cfg("blockOnBlocker")) return null;
+
+    // Same reasoning as the pre-tool guard: advice about the main agent's work is noise in a
+    // sub-agent's context, and the main agent would never see it.
+    const forSubAgent = await hookIsForSubAgent(
+        HOOK_POST_TOOL_USE,
+        (i) => i?.toolName === input?.toolName,
+    );
+    if (forSubAgent) return null;
+
+    // Injecting into the result of a question the user is answering is pointless, and the
+    // pre-tool hook already declines these for the same reason.
+    if (USER_INPUT_TOOLS.has(input?.toolName)) return null;
+
+    // Re-read rather than trusting `pending`: the guard above awaits, and `onPreToolUse` for the
+    // next call can resolve in that window and take this advice first.
+    if (!state.pendingAdvice) return null;
+    return takePendingAdvice();
+}
+
 const session = await joinSession({
     hooks: {
-        onUserPromptSubmitted: async (input) => {
-            // A sub-agent's opening prompt is dispatched here too, the advisor's own review
-            // prompt included. Adopting one as the user's goal is not merely noisy: `userPrompts`
-            // is the trusted record `downgradeUnfoundedUserClaim` corroborates against, so a
-            // sub-agent prompt landing there lets text the advisor only read back to itself pass
-            // as the user's own words. Observed: the advisor denied a main-agent tool call over a
-            // "user requirement" that was in fact a sub-agent's task prompt.
-            const forSubAgent = await hookIsForSubAgent(
-                HOOK_USER_PROMPT_SUBMITTED,
-                (i) => i?.prompt === input?.prompt,
-            );
-            if (forSubAgent) {
-                debug(`ignoring sub-agent prompt: ${truncate(input?.prompt ?? "", 120)}`);
-                return;
-            }
-
-            state.goal = input.prompt ?? "";
-            // Kept across turns: this is the only trusted record of what the user actually asked
-            // for, and a later "continue" must not erase an earlier requirement.
-            if (input.prompt) {
-                state.userPrompts.push(input.prompt);
-                if (state.userPrompts.length > USER_PROMPT_HISTORY_LIMIT) state.userPrompts.shift();
-            }
-            state.toolCallsThisTurn = 0;
-            state.toolCallsSinceCheck = 0;
-            state.pendingAdvice = null;
-            state.deferredTimelineAdvice = null;
-            // A new user turn proves the user is present and any prompt they were being shown is
-            // resolved. Clearing here is what stops a missed completion event silencing the
-            // advisor for the rest of the session: the guard fails open at the next turn.
-            state.openPrompts.clear();
-            state.lastAdviceNote = "";
-            state.activeCalls.clear();
-        },
-
         onPreToolUse: async (input) => {
             // Sub-agent tool calls reach this hook as well. Advice is written about the main
             // agent's work and is only actionable in the main agent's context: injected into a
@@ -954,6 +964,31 @@ const session = await joinSession({
             }
             debug(`delivering ${advice.severity} as context: ${advice.note}`);
             recordAdvice(advice.severity, advice.note, `injected before: ${input?.toolName}`);
+            return { additionalContext: formatAdvice(advice) };
+        },
+
+        // Delivery on the *next* tool call is the problem this hook exists to narrow. A review
+        // runs while the agent works, so its verdict routinely lands during a long tool call —
+        // and under autopilot the agent often makes no further call after it, so the advice fell
+        // through to `onAgentStop` and reached the user as a queued message attributed to them,
+        // by which time the work was finished. Firing here delivers the same advice within the
+        // same turn, as hook guidance attributed to the advisor rather than to the user.
+        //
+        // Deliberately does not carry blockers. This hook runs after the tool has already
+        // executed, so it has no `permissionDecision` to withhold — consuming a blocker here
+        // would spend it as an ordinary note and silently retire the denial that `blockOnBlocker`
+        // promises. Blockers therefore keep exactly their existing path: denied at the next
+        // `onPreToolUse`, or held to `onAgentStop`.
+        //
+        // Exactly-once delivery across all three hooks is not enforced here but by
+        // `takePendingAdvice`, which reads and clears in one synchronous step with no `await`
+        // between, so whichever hook calls first takes the advice and any other gets null.
+        onPostToolUse: async (input) => {
+            const advice = await takeAdviceForPostToolUse(input);
+            if (!advice) return;
+
+            debug(`delivering ${advice.severity} as context after: ${input?.toolName}`);
+            recordAdvice(advice.severity, advice.note, `injected after: ${input?.toolName}`);
             return { additionalContext: formatAdvice(advice) };
         },
 
@@ -1003,9 +1038,23 @@ const session = await joinSession({
 
             debug(`blocking agent stop on pending blocker: ${advice.note}`);
             recordAdvice(advice.severity, advice.note, "blocked agent stop");
-            // Enqueued as a user message by the runtime, so the framing in formatAdvice — an
-            // independent reviewer that may be wrong — is what stops it reading as the user's
-            // own instruction.
+            // KNOWN LIMITATION, deliberately accepted. The host re-delivers this `reason` into the
+            // session as a `user.message` — verbatim, with `delivery: "queued"` — so the agent
+            // receives the advisor's words attributed to the user. `AgentStopHookOutput` accepts
+            // only `decision` and `reason`: it has no `additionalContext`, which is how every
+            // other hook delivers correctly-attributed guidance, and `session.send` offers no
+            // source or attribution option either. There is therefore no supported way to reach
+            // an agent at its stop boundary without a synthetic user turn.
+            //
+            // Asaf chose to keep the block rather than lose end-of-turn enforcement, so the
+            // mitigation is framing: `formatAdvice` opens with an `<advisor>` element naming an
+            // independent reviewer that may be wrong, which is what stops it reading as the
+            // user's own instruction. `classifyPrompt` recognises that same element when the
+            // message arrives back, so the advisor never treats it as evidence the user said it.
+            //
+            // The narrower fix is `onPostToolUse`, which delivers in-turn and correctly
+            // attributed; this path only runs for advice that arrives with no tool call left to
+            // carry it. Drop the block once a stop hook can return `additionalContext`.
             return { decision: "block", reason: formatAdvice(advice) };
         },
     },
@@ -1150,6 +1199,57 @@ async function report(message) {
     }
 }
 
+// Prompts are classified from the event rather than from `onUserPromptSubmitted`, because that
+// hook cannot tell a sub-agent's opening prompt from something the user typed: measured on host
+// 1.0.84-5, its bracket carries neither `agentId` nor `parentToolCallId`, unlike the tool-use
+// hooks'. The consequence was not merely noisy. `state.userPrompts` is the trusted record
+// `downgradeUnfoundedUserClaim` corroborates against, so a sub-agent's task prompt landing there
+// let the advisor quote text it had only ever read back to itself as the user's own words, and
+// deny the main agent's tool calls over a "user requirement" that the user never stated.
+//
+// Correlating the hook against this event was tried first and rejected: the event arrived 273 ms
+// after the hook was entered, so any bounded wait is a race that fails open under load — which is
+// precisely the failure being fixed. Handling the event directly has no such window.
+//
+// Reproduce the timing with an extension that logs `hook.start` for `userPromptSubmitted` beside
+// `user.message`, then drives a `task` sub-agent; if the hook bracket ever carries an `agentId`,
+// this can move back and get simpler.
+function handleUserMessage(event) {
+    const record = { content: event?.data?.content, agentId: event?.agentId, source: event?.data?.source };
+    const { owner, isUserAuthored, setsGoal, reason } = classifyPrompt(record);
+
+    if (owner === PROMPT_OWNER_SUB_AGENT) {
+        debug(`ignoring sub-agent prompt: ${truncate(record.content ?? "", 120)}`);
+        return;
+    }
+
+    // Everything below is turn state for the main session. A cross-session message and the
+    // host's `<advisor>` follow-up both genuinely start a turn here, so both reset it; what they
+    // do not do is speak for the user.
+    if (setsGoal && record.content) state.goal = record.content;
+
+    // Kept across turns: this is the only trusted record of what the user actually asked for, and
+    // a later "continue" must not erase an earlier requirement. Gated on authorship, not on
+    // ownership — see `classifyPrompt` for why those are different questions.
+    if (isUserAuthored && record.content) {
+        state.userPrompts.push(record.content);
+        if (state.userPrompts.length > USER_PROMPT_HISTORY_LIMIT) state.userPrompts.shift();
+    } else {
+        debug(`prompt not admitted as user evidence (${reason})`);
+    }
+
+    state.toolCallsThisTurn = 0;
+    state.toolCallsSinceCheck = 0;
+    state.pendingAdvice = null;
+    state.deferredTimelineAdvice = null;
+    // A new turn proves the user is present and any prompt they were being shown is resolved.
+    // Clearing here is what stops a missed completion event silencing the advisor for the rest of
+    // the session: the guard fails open at the next turn.
+    state.openPrompts.clear();
+    state.lastAdviceNote = "";
+    state.activeCalls.clear();
+}
+
 // Counted from the event log rather than from the tool-use hooks: those fire for sub-agent tool
 // calls too and carry no agent identity, so a `task` sub-agent doing heavy work would drive the
 // review cadence on its own — and the advisor's own review agent would schedule the next review.
@@ -1216,6 +1316,9 @@ if (config._problems?.length) {
 // only these events carry an `agentId`.
 session.on((event) => {
     switch (event?.type) {
+        case "user.message":
+            handleUserMessage(event);
+            break;
         case "hook.start":
             noteHookStart(event);
             break;
