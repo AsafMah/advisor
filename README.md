@@ -227,7 +227,8 @@ silently trimmed. The panel serves on loopback with a per-session token, checks 
 and renders every dynamic value through `textContent`, so text in an advice note is structurally
 incapable of becoming markup.
 
-Activity is listed newest first and narrowed by a kind filter and a free-text search, and the layout
+Activity is listed newest first and narrowed by two filters that compose: a checkbox per kind, so
+several severities can be watched at once, and a free-text search over titles and notes. The layout
 deliberately mirrors the self-learn activity panel so the two read as one product.
 
 Opening it is up to you — the extension never opens it for you. There are no OS notifications.

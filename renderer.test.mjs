@@ -228,10 +228,7 @@ if (!EDGE) {
                 assert.equal(before, 2);
                 // The filter is re-rendered rather than hidden with CSS, so an excluded entry
                 // leaves the document entirely — asserting on visibility would measure nothing.
-                await browser.evaluate(
-                    "(() => { const s = document.querySelector('#kind');" +
-                        "s.value = 'nit'; s.dispatchEvent(new Event('input', { bubbles: true })); return true; })()",
-                );
+                await browser.evaluate("document.querySelector('input[data-tag=\"blocker\"]').click(); true");
                 await delay(200);
                 const after = await browser.evaluate(
                     "Array.from(document.querySelectorAll('#entries li')).map(e => e.dataset.kind)",
@@ -247,22 +244,90 @@ if (!EDGE) {
         );
     });
 
-    test("searching narrows the rendered activity", async () => {
+    test("two tags can be watched at once", async () => {
+        // The point of checkboxes over a dropdown: several severities at the same time. A
+        // single-selection control would make this impossible, so this is the regression that
+        // keeps it from quietly becoming one again.
         await withRenderedPanel(
             async ({ browser }) => {
+                await browser.evaluate(
+                    "for (const b of document.querySelectorAll('input[data-tag]')) {" +
+                        " if (b.dataset.tag !== 'blocker' && b.dataset.tag !== 'concern') { b.click(); } } true",
+                );
+                await delay(200);
+                const kinds = await browser.evaluate(
+                    "Array.from(document.querySelectorAll('#entries li')).map(e => e.dataset.kind)",
+                );
+                assert.deepEqual(kinds, ["concern", "blocker"], "both selected tags must remain visible");
+                assert.equal(await browser.evaluate("document.querySelector('#count').textContent"), "2 of 4");
+
+                // Re-checking restores the entry it had removed, rather than being one-way.
+                await browser.evaluate("document.querySelector('input[data-tag=\"nit\"]').click(); true");
+                await delay(200);
+                assert.equal(await browser.evaluate("document.querySelector('#count').textContent"), "3 of 4");
+            },
+            [
+                { tag: "review", title: "a review", detail: "" },
+                { tag: "nit", title: "a nit", detail: "" },
+                { tag: "blocker", title: "a blocker", detail: "" },
+                { tag: "concern", title: "a concern", detail: "" },
+            ],
+        );
+    });
+
+    test("clearing every tag empties the feed and says so", async () => {
+        await withRenderedPanel(
+            async ({ browser }) => {
+                await browser.evaluate("document.querySelectorAll('input[data-tag]').forEach(b => b.click()); true");
+                await delay(200);
+                assert.equal(await browser.evaluate("document.querySelectorAll('#entries li').length"), 0);
+                assert.equal(await browser.evaluate("document.querySelector('#count').textContent"), "0 of 2");
+                const empty = await browser.evaluate(
+                    "(() => { const e = document.querySelector('#empty'); return e.hidden ? null : e.textContent; })()",
+                );
+                // "No matching activity" and "nothing recorded yet" are different facts, and a
+                // panel that confuses them tells the user the advisor did nothing.
+                assert.equal(empty, "No matching activity.");
+            },
+            [
+                { tag: "blocker", title: "a blocker", detail: "" },
+                { tag: "nit", title: "a nit", detail: "" },
+            ],
+        );
+    });
+
+    test("search composes with the selected tags rather than replacing them", async () => {
+        await withRenderedPanel(
+            async ({ browser }) => {
+                await browser.evaluate("document.querySelector('input[data-tag=\"nit\"]').click(); true");
                 await browser.evaluate(
                     "(() => { const i = document.querySelector('#search');" +
                         "i.value = 'haystack'; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()",
                 );
                 await delay(200);
+                // Only the blocker matches both halves: the nit is deselected and the concern
+                // does not match the text. Either filter alone would show two rows.
                 const texts = await browser.evaluate(
                     "Array.from(document.querySelectorAll('#entries .entry-message')).map(e => e.textContent)",
                 );
-                assert.deepEqual(texts, ["a haystack detail"]);
+                assert.deepEqual(texts, ["a haystack blocker"]);
+                assert.equal(await browser.evaluate("document.querySelector('#count').textContent"), "1 of 3");
+
+                // Clearing the text restores the tag selection rather than the whole feed.
+                await browser.evaluate(
+                    "(() => { const i = document.querySelector('#search');" +
+                        "i.value = ''; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()",
+                );
+                await delay(200);
+                const kinds = await browser.evaluate(
+                    "Array.from(document.querySelectorAll('#entries li')).map(e => e.dataset.kind)",
+                );
+                assert.deepEqual(kinds, ["concern", "blocker"]);
             },
             [
-                { tag: "blocker", title: "a blocker", detail: "a haystack detail" },
-                { tag: "nit", title: "a nit", detail: "unrelated" },
+                { tag: "blocker", title: "a blocker", detail: "a haystack blocker" },
+                { tag: "nit", title: "a nit", detail: "a haystack nit" },
+                { tag: "concern", title: "a concern", detail: "unrelated" },
             ],
         );
     });

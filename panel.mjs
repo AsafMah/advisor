@@ -207,6 +207,10 @@ function clientScript(basePath) {
     return [
         "const BASE = " + JSON.stringify(basePath) + ";",
         "const LIMIT = " + JSON.stringify(ACTIVITY_LIMIT) + ";",
+        "const TAGS = " + JSON.stringify(PANEL_TAGS) + ";",
+        // Every tag on by default, and unchecking removes one. The panel exists to show what the
+        // advisor did, so the default has to be "all of it".
+        "const active = new Set(TAGS);",
         "let entries = [];",
         "let lastSeq = 0;",
         "let historyError = null;",
@@ -244,11 +248,13 @@ function clientScript(basePath) {
         "    : s.checkInFlight ? 'A review is running now.' : 'No pending advice.');",
         "  show('last-error', s.lastError ? 'Last review error: ' + s.lastError : null, true);",
         "}",
+        // Tag selection and search compose: an entry must pass both. Selection is a set rather
+        // than a single value so several severities can be watched at once, which is the whole
+        // reason the filter is a row of checkboxes and not a dropdown.
         "function visible() {",
-        "  const kind = el('kind').value;",
         "  const text = el('search').value.trim().toLocaleLowerCase();",
         "  return entries",
-        "    .filter((e) => (kind === 'all' || e.tag === kind) &&",
+        "    .filter((e) => active.has(e.tag) &&",
         "      ((e.title || '') + ' ' + (e.detail || '')).toLocaleLowerCase().includes(text))",
         // Newest first: the reason to open this panel is almost always the most recent thing.
         "    .reverse();",
@@ -326,7 +332,13 @@ function clientScript(basePath) {
         "  source.addEventListener('status', (ev) => renderStatus(JSON.parse(ev.data)));",
         "  source.addEventListener('refresh', () => load());",
         "}",
-        "for (const id of ['kind', 'search']) { el(id).addEventListener('input', renderEntries); }",
+        "document.querySelectorAll('input[data-tag]').forEach((box) => {",
+        "  box.addEventListener('change', () => {",
+        "    if (box.checked) { active.add(box.dataset.tag); } else { active.delete(box.dataset.tag); }",
+        "    renderEntries();",
+        "  });",
+        "});",
+        "el('search').addEventListener('input', renderEntries);",
         "el('refresh').addEventListener('click', load);",
         "window.addEventListener('pagehide', () => { if (source) { source.close(); } }, { once: true });",
         "load(); connect();",
@@ -359,11 +371,18 @@ const STYLES = [
     ".metrics div{padding:12px;border:1px solid var(--border-color-default,#d0d7de);border-radius:8px}",
     ".metrics strong{display:block;font-size:24px;font-weight:var(--font-weight-semibold,600)}",
     ".metrics span{color:var(--text-color-muted,#656d76);font-size:12px}",
-    ".filters{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 16px}",
+    ".filters{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin:8px 0 16px}",
     "label{display:flex;align-items:center;gap:8px;font-size:12px}",
+    // A borderless fieldset keeps the grouping semantics the checkboxes need while looking like
+    // the reference's single filter row. `min-width:0` so it can shrink instead of forcing the
+    // panel to scroll sideways at 320px.
+    ".kinds{border:0;margin:0;padding:0;min-width:0;display:flex;flex-wrap:wrap;gap:2px 12px;flex:1 1 260px}",
+    ".kinds legend{padding:0;font-size:12px;color:var(--text-color-muted,#656d76)}",
+    ".check{gap:6px;white-space:nowrap}",
+    ".check input{width:auto;min-width:0;padding:0;border:0;border-radius:0;accent-color:var(--color-focus-outline,#0969da)}",
     ".search{flex:1 1 180px;min-width:0}",
-    "input{width:100%;min-width:80px}",
-    "input,select,button{font:inherit;color:inherit;background:var(--background-color-default,#fff);",
+    "input[type='search']{width:100%;min-width:80px}",
+    "input,button{font:inherit;color:inherit;background:var(--background-color-default,#fff);",
     "border:1px solid var(--border-color-default,#d0d7de);border-radius:6px;padding:7px 10px}",
     "button{cursor:pointer}",
     "button:disabled{opacity:.6;cursor:wait}",
@@ -383,8 +402,8 @@ const STYLES = [
     "@media (max-width:360px){main{padding:12px}.metrics{gap:6px}.metrics div{padding:8px}header{align-items:flex-start}}",
     "@media (prefers-color-scheme:dark){",
     "body{background:var(--background-color-default,#181818);color:var(--text-color-default,#e5e5e5)}",
-    "input,select,button{background:var(--background-color-default,#181818)}",
-    ".muted,footer,.eyebrow,#connection,.metrics span,.entry-meta{color:var(--text-color-muted,#a6adb4)}",
+    "input,button{background:var(--background-color-default,#181818)}",
+    ".muted,footer,.eyebrow,#connection,.metrics span,.entry-meta,.kinds legend{color:var(--text-color-muted,#a6adb4)}",
     ".error,#connection[data-ok='no'],li[data-kind='blocker'] .entry-meta,li[data-kind='error'] .entry-meta{color:var(--true-color-red,#ff8c8c)}",
     "}",
 ].join("");
@@ -400,12 +419,11 @@ const TAG_LABELS = {
 
 /** The canvas document. `basePath` carries the per-server token, so it is never a constant. */
 export function renderPanelHtml({ basePath, title = "Advisor activity", nonce = "" }) {
-    const options = [
-        `<option value="all">All activity</option>`,
-        ...PANEL_TAGS.map(
-            (tag) => `<option value="${escapeHtml(tag)}">${escapeHtml(TAG_LABELS[tag] ?? tag)}</option>`,
-        ),
-    ].join("");
+    const filters = PANEL_TAGS.map(
+        (tag) =>
+            `<label class="check"><input type="checkbox" data-tag="${escapeHtml(tag)}" checked /> ` +
+            `${escapeHtml(TAG_LABELS[tag] ?? tag)}</label>`,
+    ).join("");
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -438,7 +456,10 @@ export function renderPanelHtml({ basePath, title = "Advisor activity", nonce = 
   <section aria-labelledby="activity-title">
     <div class="activity-heading"><h2 id="activity-title">Recent activity</h2><span id="count" class="muted"></span></div>
     <div class="filters">
-      <label>Show <select id="kind">${options}</select></label>
+      <fieldset id="kinds" class="kinds">
+        <legend>Show</legend>
+        ${filters}
+      </fieldset>
       <label class="search">Search <input id="search" type="search" placeholder="Filter advice" /></label>
     </div>
     <p id="empty" class="muted">Waiting for activity\u2026</p>
