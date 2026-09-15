@@ -176,6 +176,61 @@ Log paths are suffixed with the session id, so `advisor-advice.log` becomes
 
 Session overrides are in-memory and reset when extensions reload.
 
+## The `advisor_control` tool
+
+The app does not surface extension slash commands ([github/app#3056][cmd-issue]), so every command
+above is also reachable as a tool the agent can call when you ask about the advisor.
+
+| Operation      | Effect                                                              |
+| -------------- | ------------------------------------------------------------------- |
+| `status`       | Same content as `/advisor`.                                          |
+| `log`          | Same as `/advisor-log`; takes `count`.                               |
+| `review`       | Queues a review. See below.                                          |
+| `enable` / `disable` | As `/advisor-on` / `/advisor-off`.                             |
+| `set_model`    | Takes `model`.                                                       |
+| `set_cadence`  | Takes `everyNToolCalls`.                                             |
+| `reload_config`| Re-reads `advisor.json`.                                             |
+
+Three properties are deliberate:
+
+- **The five changing operations ask you to confirm** through `session.ui.confirm`, naming the exact
+  change, before they take effect. A host with no elicitation support throws rather than returning
+  an answer, so unavailable and declined are treated identically — a host that cannot ask you cannot
+  have been answered by you. There is no argument an agent can set to claim you already approved.
+  The slash commands are unchanged: you typed those yourself, so there is nothing to confirm.
+- **`review` is queued, not run inside the call.** Starting a sub-agent and awaiting it from inside
+  an open tool call nests one host round-trip inside another, and the review would be reading a
+  transcript that does not yet contain the call that asked for it. The request is released by that
+  tool call's own `tool.execution_complete`. The result says only that a review was queued: handing
+  the note back as tool output would be a second delivery path bypassing the severity and blocker
+  policy, delivering a blocker as ordinary text while it was still pending for the deny path.
+- **Reads are open; changing the advisor and asking it to review are main-agent only.** A `task`
+  sub-agent must not retune the advisor for a session it is only one part of, and the advisor's own
+  review agent can see this tool — without the gate it could switch itself off, or start a second
+  review of itself and disturb the cadence and pending state of the review already running. The gate
+  runs before the confirmation, so a sub-agent cannot raise a dialog in your face.
+
+Every attempted change is recorded in the activity panel, whether it was confirmed or declined.
+Reads are not: the audit records control invocations, not calls to the helpers they share with the
+panel, which re-reads state on every status tick.
+
+## The activity panel
+
+`advisor-activity` is a read-only canvas showing what the advisor has actually done this session:
+advice raised at every severity — **including advice dropped below `minSeverityToInject`**, with the
+reason — plus reviews, control changes and errors. Wiring it to the delivery path instead would hide
+every outcome that was dropped, which is the most diagnostic data there is.
+
+It updates live while open and restores durable history on reopen or reload, reconstructed from the
+advice log. History longer than the retained window is shown with a truncation notice rather than
+silently trimmed. The panel serves on loopback with a per-session token, checks `Host` and `Origin`,
+and renders every dynamic value through `textContent`, so text in an advice note is structurally
+incapable of becoming markup.
+
+Opening it is up to you — the extension never opens it for you. There are no OS notifications.
+
+[cmd-issue]: https://github.com/github/app/issues/3056
+
 ## What the advisor sees
 
 Each review is given four things:

@@ -263,6 +263,63 @@ function createHost(sessionId) {
         return command.handler("");
     };
 
+    /**
+     * Invokes a registered tool the way the runtime does — and the ordering is the point.
+     *
+     * The SDK calls the handler from inside its own dispatch of `external_tool.requested`,
+     * synchronously *before* that event reaches `session.on` listeners. A test that emitted the
+     * event first would prove nothing: it would be exercising a lookup that always hits. So the
+     * handler is started first and the event emitted after, which is the race the extension's
+     * `setTimeout(0)` yield exists to survive.
+     */
+    host.callTool = (name, args = {}, { agentId = null, toolCallId = `call-${++bracket}` } = {}) => {
+        const tool = host.registered.tools?.find((t) => t.name === name);
+        if (!tool) throw new Error(`tool not registered: ${name}`);
+        const result = tool.handler(args, { sessionId, toolCallId, toolName: name, arguments: args });
+        emit({ type: "external_tool.requested", agentId, data: { toolCallId, toolName: name } });
+        return result;
+    };
+
+    /**
+     * Waits for `predicate` to hold. Work the extension starts from an event finishes on its own
+     * timeline with nothing to await, so tests watch for the effect rather than sleeping a guessed
+     * interval — which would be both slower and less reliable.
+     */
+    host.waitFor = async (predicate, label = "condition", timeoutMs = 5000) => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            if (await predicate()) return;
+            if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+            await new Promise((r) => setTimeout(r, 10));
+        }
+    };
+
+    /**
+     * Gives event-driven work a bounded chance to happen, for the assertions that it does not.
+     * Longer than the harness poll interval, so a review that was going to start has started.
+     */
+    host.quiesce = (ms = 400) => new Promise((r) => setTimeout(r, ms));
+
+    // --- driving the registered canvas -------------------------------------------------------
+
+    const canvas = () => {
+        const declared = host.registered.canvases?.[0];
+        if (!declared) throw new Error("no canvas registered");
+        return declared;
+    };
+    host.canvas = canvas;
+    const canvasCtx = (instanceId, extra = {}) => ({
+        sessionId,
+        extensionId: "advisor",
+        canvasId: canvas().declaration.id,
+        instanceId,
+        ...extra,
+    });
+    host.openCanvas = (instanceId = "panel-1", input) => canvas().open(canvasCtx(instanceId, { input }));
+    host.canvasAction = (actionName, instanceId = "panel-1", input) =>
+        canvas().invokeAction(actionName, canvasCtx(instanceId, { actionName, input }));
+    host.closeCanvas = (instanceId = "panel-1") => canvas().onClose?.(canvasCtx(instanceId));
+
     return host;
 }
 

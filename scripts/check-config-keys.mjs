@@ -16,10 +16,19 @@ const defaults = [...src.slice(start, src.indexOf("};", start)).matchAll(/^ {4}(
 const example = Object.keys(JSON.parse(read("advisor.example.json")));
 
 const backtick = String.fromCharCode(96);
-// The config table is the only one whose rows are `key` | `default` | meaning, so require a
-// second backticked cell to avoid matching the severity table.
+// Scoped to the Configuration section rather than the whole README: other sections document
+// tool operations and commands in tables of the same shape, and a heuristic that matched them
+// would report every one of them as an undeclared config key.
+const readme = read("README.md");
+const configStart = readme.indexOf("\n## Configuration");
+if (configStart === -1) {
+    console.error("MISMATCH  README has no '## Configuration' section to read the key table from");
+    process.exit(1);
+}
+const nextHeading = readme.indexOf("\n## ", configStart + 1);
+const configSection = readme.slice(configStart, nextHeading === -1 ? readme.length : nextHeading);
 const rowPattern = new RegExp(`^\\| ${backtick}(\\w+)${backtick}\\s*\\|[^|]*${backtick}`, "gm");
-const documented = [...new Set([...read("README.md").matchAll(rowPattern)].map((m) => m[1]))];
+const documented = [...new Set([...configSection.matchAll(rowPattern)].map((m) => m[1]))];
 
 let failed = false;
 const compare = (a, b, aName, bName) => {
