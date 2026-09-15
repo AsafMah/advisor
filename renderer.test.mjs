@@ -406,6 +406,34 @@ if (!EDGE) {
     const text = (id) => "document.getElementById('" + id + "').textContent";
     const hidden = (id) => "document.getElementById('" + id + "').hidden";
 
+    // `.click()` dispatches straight at the node, so it passes whether or not the button is
+    // reachable. This drives the pointer at real coordinates and returns whatever the browser
+    // actually hit there, which is the only way a test can tell a working button from a covered,
+    // scrolled-away or zero-sized one.
+    async function realClick(browser, id) {
+        const box = JSON.parse(
+            await browser.evaluate(
+                "(() => { const n = document.getElementById('" +
+                    id +
+                    "'); n.scrollIntoView({ block: 'center' }); const r = n.getBoundingClientRect();" +
+                    " const x = r.x + r.width / 2, y = r.y + r.height / 2;" +
+                    " const at = document.elementFromPoint(x, y);" +
+                    " return JSON.stringify({ x: x, y: y, hit: at ? at.id : null }); })()",
+            ),
+        );
+        for (const type of ["mousePressed", "mouseReleased"]) {
+            await browser.send("Input.dispatchMouseEvent", {
+                type,
+                x: box.x,
+                y: box.y,
+                button: "left",
+                clickCount: 1,
+                buttons: type === "mousePressed" ? 1 : 0,
+            });
+        }
+        return box.hit;
+    }
+
     test("the settings form seeds from the advisor and hides its controls until edited", async () => {
         await withRenderedPanel(async ({ browser }) => {
             assert.equal(await browser.evaluate("document.getElementById('set-enabled').checked"), true);
@@ -415,39 +443,67 @@ if (!EDGE) {
         });
     });
 
-    test("reviewing a change shows the exact edit and sends nothing", async () => {
+    test("editing previews the exact change and sends nothing", async () => {
         await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
             await browser.evaluate(edit("cadence", "9"));
-            assert.equal(await browser.evaluate(hidden("settings-actions")), false);
-            await browser.evaluate(click("settings-review"));
             await delay(100);
+            assert.equal(await browser.evaluate(hidden("settings-actions")), false);
+            assert.equal(await browser.evaluate(hidden("settings-preview")), false, "the change is shown without a click");
 
             const lines = await browser.evaluate(
                 "Array.from(document.querySelectorAll('#settings-diff li')).map(e => e.textContent)",
             );
             assert.deepEqual(lines, ["Review cadence: every 6 tool calls \u2192 every 9 tool calls"]);
-            assert.equal(applied.length, 0, "reviewing must not reach the extension");
+            assert.equal(applied.length, 0, "previewing must not reach the extension");
             assert.equal(settingsOf().everyNToolCalls, 6);
         });
     });
 
-    test("cancelling the confirmation applies nothing and keeps the edit", async () => {
-        await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
+    test("the preview follows every edit rather than freezing at the first", async () => {
+        await withRenderedPanel(async ({ browser, applied }) => {
+            await browser.evaluate(edit("cadence", "9"));
+            await delay(60);
             await browser.evaluate(edit("model", "claude-opus-5"));
-            await browser.evaluate(click("settings-review"));
-            await delay(100);
-            await browser.evaluate(click("settings-cancel"));
             await delay(100);
 
-            assert.equal(applied.length, 0, "cancel must send nothing");
-            assert.equal(settingsOf().model, "gpt-5.6-terra");
-            assert.equal(await browser.evaluate(hidden("settings-confirm")), true);
-            assert.match(await browser.evaluate(text("settings-result")), /cancelled/i);
-            assert.equal(
-                await browser.evaluate("document.getElementById('set-model').value"),
-                "claude-opus-5",
-                "cancelling an apply is not discarding what was typed",
+            const lines = await browser.evaluate(
+                "Array.from(document.querySelectorAll('#settings-diff li')).map(e => e.textContent)",
             );
+            assert.deepEqual(lines, [
+                "Model: gpt-5.6-terra \u2192 claude-opus-5",
+                "Review cadence: every 6 tool calls \u2192 every 9 tool calls",
+            ]);
+
+            // Back to the advisor's own value: there is nothing left to apply, so nothing is offered.
+            await browser.evaluate(edit("cadence", "6"));
+            await browser.evaluate(edit("model", "gpt-5.6-terra"));
+            await delay(100);
+            assert.equal(await browser.evaluate(hidden("settings-preview")), true);
+            assert.equal(await browser.evaluate(hidden("settings-actions")), true);
+            assert.equal(applied.length, 0);
+        });
+    });
+
+    // The defect this replaces: a review could be invalidated by any later edit, after which the
+    // Apply button returned before doing anything at all — no request, no message, nothing to see.
+    // `.click()` cannot catch that class on its own because it skips hit-testing, so this drives
+    // the real pointer at the real coordinates and asserts what the user would have seen.
+    test("Apply posts after an edit that follows an edit, and is really clickable", async () => {
+        await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
+            await browser.evaluate(edit("cadence", "9"));
+            await delay(60);
+            await browser.evaluate(edit("enabled", false));
+            await delay(60);
+            await browser.evaluate(edit("cadence", "11"));
+            await delay(100);
+
+            const hit = await realClick(browser, "settings-apply");
+            assert.equal(hit, "settings-apply", "the Apply button must be where the user clicks");
+            await delay(400);
+
+            assert.equal(applied.length, 1, "one press, one write");
+            assert.deepEqual(settingsOf(), { enabled: false, model: "gpt-5.6-terra", everyNToolCalls: 11 });
+            assert.match(await browser.evaluate(text("settings-result")), /Applied:/);
         });
     });
 
@@ -460,6 +516,7 @@ if (!EDGE) {
             assert.equal(applied.length, 0);
             assert.equal(await browser.evaluate("document.getElementById('set-cadence').value"), "6");
             assert.equal(await browser.evaluate(hidden("settings-actions")), true);
+            assert.equal(await browser.evaluate(hidden("settings-preview")), true);
         });
     });
 
@@ -467,8 +524,6 @@ if (!EDGE) {
         await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
             await browser.evaluate(edit("cadence", "9"));
             await browser.evaluate(edit("enabled", false));
-            await browser.evaluate(click("settings-review"));
-            await delay(100);
             await browser.evaluate(click("settings-apply"));
             await delay(400);
 
@@ -481,12 +536,35 @@ if (!EDGE) {
         });
     });
 
+    // Silence is what made the old button look broken, so no press may end without a line of text.
+    test("every press of Apply says what happened, including when it did nothing", async () => {
+        await withRenderedPanel(async ({ browser, applied }) => {
+            // Dirty, but back at the advisor's own values: the press is real and must answer.
+            await browser.evaluate(edit("cadence", "9"));
+            await browser.evaluate(edit("cadence", "6"));
+            await browser.evaluate(click("settings-apply"));
+            await delay(200);
+            assert.match(await browser.evaluate(text("settings-result")), /Nothing to change/i);
+            assert.equal(applied.length, 0);
+
+            await browser.evaluate(edit("cadence", "0"));
+            await browser.evaluate(click("settings-apply"));
+            await delay(200);
+            assert.match(await browser.evaluate(text("settings-result")), /Not applied \u2014 Review cadence/);
+            assert.equal(applied.length, 0, "an invalid value is refused here, not sent");
+
+            await browser.evaluate(edit("model", "   "));
+            await browser.evaluate(click("settings-apply"));
+            await delay(200);
+            assert.match(await browser.evaluate(text("settings-result")), /Not applied \u2014 Model/);
+            assert.equal(applied.length, 0);
+        });
+    });
+
     test("a refused change says so and leaves the form alone", async () => {
         await withRenderedPanel(
             async ({ browser, settingsOf }) => {
                 await browser.evaluate(edit("cadence", "9"));
-                await browser.evaluate(click("settings-review"));
-                await delay(100);
                 await browser.evaluate(click("settings-apply"));
                 await delay(400);
 
@@ -494,6 +572,7 @@ if (!EDGE) {
                 assert.match(await browser.evaluate(text("settings-result")), /somebody else/);
                 assert.equal(settingsOf().everyNToolCalls, 6);
                 assert.equal(await browser.evaluate("document.getElementById('set-cadence').value"), "9");
+                assert.equal(await browser.evaluate(hidden("settings-actions")), false, "the edit is still there to retry");
             },
             [],
             {
@@ -538,8 +617,8 @@ if (!EDGE) {
 
     test("a lost response locks the form rather than claiming nothing happened", async () => {
         // The write reaches the extension and lands; only the answer is lost. Saying "not
-        // applied" there would be a guess, and letting Cancel or Reset redraw the pre-write
-        // values would dress that guess up as the current state.
+        // applied" there would be a guess, and letting Reset redraw the pre-write values would
+        // dress that guess up as the current state.
         await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
             await browser.evaluate(
                 "(() => { const real = window.fetch.bind(window); window.__realFetch = real;" +
@@ -547,8 +626,6 @@ if (!EDGE) {
                     " if (String(a[0]).endsWith('settings')) { await r.text(); throw new TypeError('connection lost'); } return r; }; return true; })()",
             );
             await browser.evaluate(edit("cadence", "9"));
-            await browser.evaluate(click("settings-review"));
-            await delay(100);
             await browser.evaluate(click("settings-apply"));
             await delay(400);
 
@@ -556,12 +633,13 @@ if (!EDGE) {
             assert.equal(settingsOf().everyNToolCalls, 9, "and really did land");
             assert.match(await browser.evaluate(text("settings-result")), /Outcome unknown/);
             assert.equal(await browser.evaluate("document.getElementById('set-cadence').disabled"), true);
-            assert.equal(await browser.evaluate("document.getElementById('settings-review').disabled"), true);
+            assert.equal(await browser.evaluate("document.getElementById('settings-apply').disabled"), true);
 
-            // Cancel and Reset must not overwrite the uncertainty with a comforting claim.
-            await browser.evaluate(click("settings-cancel"));
+            // Reset must not overwrite the uncertainty with a comforting claim, and a locked
+            // Apply must not resubmit on top of a change that may already have happened.
             await browser.evaluate(click("settings-reset"));
-            await delay(100);
+            await browser.evaluate(click("settings-apply"));
+            await delay(200);
             assert.match(await browser.evaluate(text("settings-result")), /Outcome unknown/);
             assert.equal(applied.length, 1, "a locked form must not resubmit");
 

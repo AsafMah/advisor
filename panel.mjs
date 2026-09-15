@@ -322,11 +322,11 @@ function clientScript(basePath) {
         // instead of silently overwriting it.
         "let base = null;",
         "let dirty = false;",
-        "let pending = null;",
         "const UNKNOWN = 'Outcome unknown \\u2014 the change may or may not have been applied. Refresh to see the current settings.';",
         // The edit controls only appear once there is an edit to act on, so an untouched panel
-        // reads as the status display it mostly is.
-        "function updateDirty() { el('settings-actions').hidden = !(dirty || unknown); }",
+        // reads as the status display it mostly is. The preview follows the same edit, so the
+        // exact change is always on screen next to the button that sends it.
+        "function updateDirty() { el('settings-actions').hidden = !(dirty || unknown); renderPreview(); }",
         // A request that left this document and did not come back leaves the panel with no idea
         // what the advisor now holds. The honest response is to stop pretending: the form locks,
         // so a second Apply cannot land on top of a change that may already have happened, and
@@ -335,7 +335,7 @@ function clientScript(basePath) {
         "let unknown = false;",
         "function setUnknown(on) {",
         "  unknown = on;",
-        "  for (const id of ['set-enabled', 'set-model', 'set-cadence', 'settings-review', 'settings-reset']) {",
+        "  for (const id of ['set-enabled', 'set-model', 'set-cadence', 'settings-apply', 'settings-reset']) {",
         "    el(id).disabled = on;",
         "  }",
         "  updateDirty();",
@@ -378,7 +378,16 @@ function clientScript(basePath) {
         "  node.dataset.ok = ok ? 'yes' : 'no';",
         "  node.className = ok ? 'muted' : 'error';",
         "}",
-        "function closeConfirm() { pending = null; el('settings-confirm').hidden = true; }",
+        "function renderPreview() {",
+        "  const box = el('settings-preview');",
+        "  const list = el('settings-diff');",
+        "  list.replaceChildren();",
+        "  if (!base || !dirty) { box.hidden = true; return; }",
+        "  const desired = readForm();",
+        "  const lines = validateForm(desired) ? [] : diffSettings(base, desired);",
+        "  for (const line of lines) { const li = document.createElement('li'); li.textContent = line; list.append(li); }",
+        "  box.hidden = lines.length === 0;",
+        "}",
         // A push from the server must not overwrite what the user is halfway through typing, and
         // must not be hidden from them either. So an edited form keeps its values and gains a
         // notice; an untouched one just follows the advisor.
@@ -387,7 +396,8 @@ function clientScript(basePath) {
         "  if (sameSettings(base, next)) { return; }",
         "  const first = base === null;",
         "  base = next;",
-        "  if (first || !(dirty || pending)) { fillForm(next); show('settings-note', null, false); return; }",        "  show('settings-note', 'The advisor changed elsewhere while you were editing. Your edits are kept \\u2014 review them again before applying.', false);",
+        "  if (first || !dirty) { fillForm(next); show('settings-note', null, false); updateDirty(); return; }",        "  show('settings-note', 'The advisor changed elsewhere while you were editing. Your edits are kept \\u2014 check them before applying.', false);",
+        "  updateDirty();",
         "}",
         "function validateForm(desired) {",
         "  if (!desired.model) { return 'Model must not be empty.'; }",
@@ -396,37 +406,35 @@ function clientScript(basePath) {
         "  }",
         "  return null;",
         "}",
-        // Two steps on purpose: nothing is sent until the exact change has been shown back and
-        // accepted. The confirmation is this document's own, not a host dialog, so reviewing a
-        // change costs the session nothing and starts no turn.
-        "function reviewSettings(ev) {",
-        "  if (ev) { ev.preventDefault(); }",
-        "  if (unknown) { return; }",
-        "  settingsResult(null, true);",
-        "  if (!base) { settingsResult('Not applied \\u2014 current settings are not loaded yet.', false); return; }",
-        "  const desired = readForm();",
-        "  const problem = validateForm(desired);",
-        "  if (problem) { closeConfirm(); settingsResult('Not applied \\u2014 ' + problem, false); return; }",
-        "  const lines = diffSettings(base, desired);",
-        "  if (lines.length === 0) { closeConfirm(); settingsResult('Nothing to change.', true); return; }",
-        "  pending = desired;",
-        "  const list = el('settings-diff'); list.replaceChildren();",
-        "  for (const line of lines) { const li = document.createElement('li'); li.textContent = line; list.append(li); }",
-        "  el('settings-confirm').hidden = false;",
-        "  el('settings-apply').focus();",
-        "}",
+        // Reset discards the edits and puts the advisor's own values back. It sends nothing.
         "function resetSettings() {",
         "  if (unknown) { return; }",
-        "  closeConfirm();",
         "  dirty = false;",
         "  if (base) { fillForm(base); }",
         "  show('settings-note', null, false);",
         "  settingsResult(null, true);",
         "  updateDirty();",
         "}",
-        "async function applySettings() {",
-        "  if (!pending || !base) { return; }",
-        "  const desired = pending;",
+        // One button, one meaning. The change is previewed live above it as the form is edited, so
+        // the user sees exactly what will be sent without paying a click for it — and, unlike the
+        // review gate this replaces, there is no second piece of state that an edit can quietly
+        // invalidate, leaving a button that does nothing and says nothing.
+        //
+        // Every path out of here writes a result line. A press that changes nothing must still say
+        // so: silence is indistinguishable from a broken button, which is exactly how the gate
+        // this replaces was reported.
+        "async function applySettings(ev) {",
+        "  if (ev) { ev.preventDefault(); }",
+        "  settingsResult(null, true);",
+        "  if (unknown) { settingsResult('Not applied \\u2014 refresh to read the advisor\\u0027s current settings first.', false); return; }",
+        "  if (!base) { settingsResult('Not applied \\u2014 current settings are not loaded yet.', false); return; }",
+        "  const desired = readForm();",
+        "  const problem = validateForm(desired);",
+        "  if (problem) { settingsResult('Not applied \\u2014 ' + problem, false); return; }",
+        // The baseline is read once, here, so the request answers for the values the preview was
+        // showing rather than whatever a push replaced them with mid-flight.
+        "  const expected = base;",
+        "  if (diffSettings(expected, desired).length === 0) { settingsResult('Nothing to change.', true); return; }",
         "  const button = el('settings-apply');",
         "  button.disabled = true;",
         "  try {",
@@ -434,10 +442,9 @@ function clientScript(basePath) {
         "      method: 'POST',",
         "      cache: 'no-store',",
         "      headers: { 'Content-Type': 'application/json' },",
-        "      body: JSON.stringify({ expected: base, desired: desired }),",
+        "      body: JSON.stringify({ expected: expected, desired: desired }),",
         "    });",
         "    const body = await r.json().catch(() => null);",
-        "    closeConfirm();",
         "    if (body && body.settings) { base = settingsOf(body.settings); }",
         "    if (body && body.status) { renderStatus(body.status); }",
         "    if (body && body.ok) {",
@@ -451,6 +458,7 @@ function clientScript(basePath) {
         // anything. Anything else — a 5xx, a body that is not the answer to this question — is
         // not evidence that nothing happened, and saying so would be a guess dressed as a fact.
         "    } else if (body && body.message && r.status < 500) {",
+        "      updateDirty();",
         "      settingsResult('Not applied \\u2014 ' + body.message, false);",
         "    } else {",
         "      setUnknown(true);",
@@ -459,11 +467,10 @@ function clientScript(basePath) {
         "  } catch (err) {",
         // The request left this document. Whether it arrived is exactly what a network error does
         // not say, so this cannot claim the settings were left alone.
-        "    closeConfirm();",
         "    setUnknown(true);",
         "    settingsResult(UNKNOWN + ' (' + err.message + ')', false);",
         "  } finally {",
-        "    button.disabled = false;",
+        "    button.disabled = unknown;",
         "  }",
         "}",
         // Tag selection and search compose: an entry must pass both. Selection is a set rather
@@ -528,7 +535,7 @@ function clientScript(basePath) {
         // A successful read is the only thing that can resolve an unknown outcome: it is the
         // advisor's actual state, which is exactly what the failed request left in doubt.
         "    const recovered = unknown;",
-        "    if (recovered) { dirty = false; closeConfirm(); base = null; setUnknown(false); }",
+        "    if (recovered) { dirty = false; base = null; setUnknown(false); }",
         "    applySnapshot(await r.json());",
         "    if (recovered) { show('settings-note', null, false); settingsResult('Reloaded \\u2014 these are the advisor\\u0027s current settings.', true); }",
         "    setConn('Live updates connected', true);",
@@ -563,14 +570,12 @@ function clientScript(basePath) {
         "});",
         "el('search').addEventListener('input', renderEntries);",
         "el('refresh').addEventListener('click', load);",
-        "el('settings').addEventListener('submit', reviewSettings);",
+        // Apply is the form's submit button, so the click and the Enter key are the same path —
+        // bound once, so a press cannot post twice.
+        "el('settings').addEventListener('submit', applySettings);",
         "el('settings-reset').addEventListener('click', resetSettings);",
-        "el('settings-apply').addEventListener('click', applySettings);",
-        // Cancel closes the confirmation and sends nothing. The edits stay in the form, because
-        // cancelling an apply is not the same as discarding what was typed.
-        "el('settings-cancel').addEventListener('click', () => { closeConfirm(); if (!unknown) { settingsResult('Not applied \\u2014 cancelled.', false); } });",
         "for (const id of ['set-enabled', 'set-model', 'set-cadence']) {",
-        "  const onEdit = () => { if (unknown) { return; } dirty = !sameSettings(base, readForm()); closeConfirm(); updateDirty(); };",
+        "  const onEdit = () => { if (unknown) { return; } dirty = !sameSettings(base, readForm()); updateDirty(); };",
         "  el(id).addEventListener('input', onEdit);",
         "  el(id).addEventListener('change', onEdit);",
         "}",
@@ -700,24 +705,24 @@ export function renderPanelHtml({ basePath, title = "Advisor activity", nonce = 
   <section aria-labelledby="settings-title">
     <h2 id="settings-title">Session settings</h2>
     <p class="muted">These apply to this session only. Your configuration file is not changed, and a review already running is not cancelled.</p>
-    <form id="settings" class="settings">
+    <!-- novalidate: the browser's own constraint check blocks submit before any handler runs and
+         answers with a transient tooltip, which is another way for a press of Apply to look like
+         nothing happened. The form's rules are enforced in validateForm, which always writes a
+         result line the user can read. -->
+    <form id="settings" class="settings" novalidate>
       <label class="check"><input id="set-enabled" type="checkbox" /> Advisor enabled</label>
       <label class="field">Model<input id="set-model" type="text" autocomplete="off" spellcheck="false" /></label>
       <label class="field">Review every N tool calls<input id="set-cadence" type="number" min="1" step="1" /></label>
       <p id="settings-note" class="muted" role="status" aria-live="polite" hidden></p>
+      <div id="settings-preview" class="confirm" hidden>
+        <p><strong>Pending change</strong></p>
+        <ul id="settings-diff"></ul>
+      </div>
       <div id="settings-actions" class="row" hidden>
-        <button id="settings-review" type="submit">Review change</button>
+        <button id="settings-apply" type="submit">Apply change</button>
         <button id="settings-reset" type="button">Reset</button>
       </div>
     </form>
-    <div id="settings-confirm" class="confirm" hidden>
-      <p><strong>Apply this change?</strong></p>
-      <ul id="settings-diff"></ul>
-      <div class="row">
-        <button id="settings-apply" type="button">Apply change</button>
-        <button id="settings-cancel" type="button">Cancel</button>
-      </div>
-    </div>
     <p id="settings-result" class="muted" role="status" aria-live="polite" hidden></p>
   </section>
   <section aria-labelledby="activity-title">

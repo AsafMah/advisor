@@ -1169,6 +1169,10 @@ function applyPanelSettings({ expected, desired }) {
     const current = currentSettings();
     const drifted = SETTINGS_KEYS.filter((key) => expected[key] !== current[key]);
     if (drifted.length > 0) {
+        // A refusal is the one outcome with no activity entry — nothing changed, so nothing is
+        // worth showing the user in the feed. It still has to be visible *somewhere*: a panel
+        // write that vanishes without trace is exactly what made the last one hard to diagnose.
+        debug(`panel settings refused: stale baseline (${drifted.join(", ")})`);
         return {
             ok: false,
             code: "stale",

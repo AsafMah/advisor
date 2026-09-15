@@ -238,16 +238,18 @@ review model, and the review cadence. Everything else — the policy knobs, `rel
 a review — stays with the command and the tool, because those are either the model's business or a
 decision this UI has no way to confirm safely.
 
-The flow is edit, then **Review**, which shows the exact before-and-after of every field that
-changed, then **Apply** or **Cancel**. Nothing is sent until Apply; Cancel sends nothing and keeps
-what was typed. Applying starts no review and sends no message: it changes the session's settings
-and nothing else. The changes are session overrides only and never touch the config file, and they
-are recorded in the activity feed as coming from the panel, separately from the same change made by
-a slash command or by the tool — the tool is the model asking, and the model is the thing under
-review.
+Editing a field previews the exact before-and-after of every field that changed, directly above a
+single **Apply** button; **Reset** discards the edits and puts the advisor's own values back. The
+preview costs no click, so the change is on screen next to the button that sends it. Nothing leaves
+the document until Apply, and every press of Apply writes a line saying what happened — including
+when it did nothing, because a silent button is indistinguishable from a broken one. Applying starts
+no review and sends no message: it changes the session's settings and nothing else. The changes are
+session overrides only and never touch the config file, and they are recorded in the activity feed
+as coming from the panel, separately from the same change made by a slash command or by the tool —
+the tool is the model asking, and the model is the thing under review.
 
 Applies are atomic and checked against the state the form was filled from, so a setting changed
-elsewhere while the confirmation was open is refused rather than quietly overwritten. If a reply is
+elsewhere while the form was open is refused rather than quietly overwritten. If a reply is
 lost in flight the panel says the outcome is **unknown** and locks the form rather than claiming
 nothing happened; only a successful refresh resolves it.
 
