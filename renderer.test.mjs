@@ -118,7 +118,20 @@ async function launchBrowser() {
 async function withRenderedPanel(run, entries = []) {
     const log = createActivityLog();
     for (const entry of entries) log.push(entry);
-    const status = { enabled: true, model: "gpt-5.6-terra", checksRun: 3, pendingAdvice: null };
+    const status = {
+        enabled: true,
+        model: "gpt-5.6-terra",
+        agentType: "general-purpose",
+        everyNToolCalls: 6,
+        currentInterval: 6,
+        blockOnBlocker: true,
+        checksRun: 3,
+        adviceDelivered: 1,
+        toolCallsSinceCheck: 2,
+        checkInFlight: false,
+        pendingAdvice: null,
+        lastError: null,
+    };
     const panel = await createPanelServer({
         title: "Advisor activity",
         getSnapshot: () => ({ status, entries: log.list(), historyError: null, historyTruncated: false }),
@@ -151,11 +164,17 @@ if (!EDGE) {
     test("the panel renders its entries in a real browser", async () => {
         await withRenderedPanel(
             async ({ browser }) => {
-                const titles = await browser.evaluate(
-                    "Array.from(document.querySelectorAll('.entry .title')).map(e => e.textContent)",
+                const metas = await browser.evaluate(
+                    "Array.from(document.querySelectorAll('#entries .entry-meta')).map(e => e.textContent)",
                 );
-                assert.ok(titles.length >= 2, `expected rendered entries, got ${JSON.stringify(titles)}`);
-                assert.ok(titles.some((t) => t.includes("first finding")));
+                assert.ok(metas.length >= 2, `expected rendered entries, got ${JSON.stringify(metas)}`);
+                assert.ok(metas.some((t) => t.includes("first finding")));
+                // Newest first, matching the reference panel.
+                assert.ok(metas[0].includes("second finding"), `unexpected order: ${JSON.stringify(metas)}`);
+                const phase = await browser.evaluate("document.querySelector('#phase').textContent");
+                assert.equal(phase, "Watching");
+                const count = await browser.evaluate("document.querySelector('#count').textContent");
+                assert.equal(count, "2 of 2");
             },
             [
                 { tag: "blocker", title: "first finding", detail: "do not ship" },
@@ -190,7 +209,7 @@ if (!EDGE) {
     test("a live entry appears without a reload", async () => {
         await withRenderedPanel(
             async ({ browser, log }) => {
-                const before = await browser.evaluate("document.querySelectorAll('.entry').length");
+                const before = await browser.evaluate("document.querySelectorAll('#entries li').length");
                 log.push({ tag: "blocker", title: "arrived while open", detail: "live" });
                 await delay(700);
                 const after = await browser.evaluate(
@@ -205,16 +224,21 @@ if (!EDGE) {
     test("filtering removes the entries it excludes", async () => {
         await withRenderedPanel(
             async ({ browser }) => {
-                const before = await browser.evaluate("document.querySelectorAll('.entry').length");
+                const before = await browser.evaluate("document.querySelectorAll('#entries li').length");
                 assert.equal(before, 2);
                 // The filter is re-rendered rather than hidden with CSS, so an excluded entry
                 // leaves the document entirely — asserting on visibility would measure nothing.
-                await browser.evaluate("document.querySelector('input[data-tag=\"blocker\"]').click(); true");
+                await browser.evaluate(
+                    "(() => { const s = document.querySelector('#kind');" +
+                        "s.value = 'nit'; s.dispatchEvent(new Event('input', { bubbles: true })); return true; })()",
+                );
                 await delay(200);
                 const after = await browser.evaluate(
-                    "Array.from(document.querySelectorAll('.entry')).map(e => e.dataset.tag)",
+                    "Array.from(document.querySelectorAll('#entries li')).map(e => e.dataset.kind)",
                 );
                 assert.deepEqual(after, ["nit"], "the filter did not remove exactly the blocker");
+                const count = await browser.evaluate("document.querySelector('#count').textContent");
+                assert.equal(count, "1 of 2");
             },
             [
                 { tag: "blocker", title: "a blocker", detail: "" },
@@ -223,22 +247,60 @@ if (!EDGE) {
         );
     });
 
-    test("the panel is usable at a narrow panel width", async () => {
+    test("searching narrows the rendered activity", async () => {
         await withRenderedPanel(
             async ({ browser }) => {
-                await browser.send("Emulation.setDeviceMetricsOverride", {
-                    width: 320,
-                    height: 800,
-                    deviceScaleFactor: 1,
-                    mobile: false,
-                });
-                await delay(200);
-                const overflow = await browser.evaluate(
-                    "document.documentElement.scrollWidth > document.documentElement.clientWidth + 2",
+                await browser.evaluate(
+                    "(() => { const i = document.querySelector('#search');" +
+                        "i.value = 'haystack'; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()",
                 );
-                assert.equal(overflow, false, "the panel overflows horizontally at 320px");
+                await delay(200);
+                const texts = await browser.evaluate(
+                    "Array.from(document.querySelectorAll('#entries .entry-message')).map(e => e.textContent)",
+                );
+                assert.deepEqual(texts, ["a haystack detail"]);
             },
-            [{ tag: "blocker", title: "a fairly long finding title that has to wrap somewhere", detail: "x".repeat(400) }],
+            [
+                { tag: "blocker", title: "a blocker", detail: "a haystack detail" },
+                { tag: "nit", title: "a nit", detail: "unrelated" },
+            ],
         );
     });
+
+    for (const scheme of ["light", "dark"]) {
+        test(`the panel is usable at a narrow panel width in ${scheme} mode`, async () => {
+            await withRenderedPanel(
+                async ({ browser }) => {
+                    await browser.send("Emulation.setEmulatedMedia", {
+                        features: [{ name: "prefers-color-scheme", value: scheme }],
+                    });
+                    await browser.send("Emulation.setDeviceMetricsOverride", {
+                        width: 320,
+                        height: 800,
+                        deviceScaleFactor: 1,
+                        mobile: false,
+                    });
+                    await delay(200);
+                    const overflow = await browser.evaluate(
+                        "document.documentElement.scrollWidth > document.documentElement.clientWidth + 2",
+                    );
+                    assert.equal(overflow, false, "the panel overflows horizontally at 320px");
+                    // A restyle that leaves text the same colour as its background renders a
+                    // blank panel while every structural assertion above still passes.
+                    const contrast = await browser.evaluate(
+                        "(() => { const s = getComputedStyle(document.body);" +
+                            " return s.color !== s.backgroundColor; })()",
+                    );
+                    assert.equal(contrast, true, "body text and background resolved to the same colour");
+                },
+                [
+                    {
+                        tag: "blocker",
+                        title: "a fairly long finding title that has to wrap somewhere",
+                        detail: "x".repeat(400),
+                    },
+                ],
+            );
+        });
+    }
 }

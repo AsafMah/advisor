@@ -206,145 +206,206 @@ export function escapeHtml(value) {
 function clientScript(basePath) {
     return [
         "const BASE = " + JSON.stringify(basePath) + ";",
-        "const TAGS = " + JSON.stringify(PANEL_TAGS) + ";",
-        "const active = new Set(TAGS);",
+        "const LIMIT = " + JSON.stringify(ACTIVITY_LIMIT) + ";",
         "let entries = [];",
         "let lastSeq = 0;",
         "let historyError = null;",
         "let historyTruncated = false;",
+        "let adviceLogPath = null;",
         "let source = null;",
         "const el = (id) => document.getElementById(id);",
-        "function setConn(text, ok) { const c = el('conn'); c.textContent = text; c.dataset.ok = ok ? 'yes' : 'no'; }",
-        "function pair(dl, label, value) {",
-        "  const dt = document.createElement('dt'); dt.textContent = label;",
-        "  const dd = document.createElement('dd'); dd.textContent = value;",
-        "  dl.appendChild(dt); dl.appendChild(dd);",
+        "const set = (id, value) => { el(id).textContent = String(value); };",
+        "function show(id, value, isError) {",
+        "  const node = el(id);",
+        "  node.textContent = value || '';",
+        "  node.hidden = !value;",
+        "  node.className = isError ? 'error' : 'muted';",
+        "}",
+        // The badge answers "what is it doing right now" in one word, which the reference panel
+        // puts beside the section title. Order matters: disabled outranks in-flight, and a
+        // pending blocker outranks idle watching.
+        "function phaseOf(s) {",
+        "  if (!s) { return 'Loading'; }",
+        "  if (!s.enabled) { return 'Disabled'; }",
+        "  if (s.checkInFlight) { return 'Reviewing'; }",
+        "  if (s.pendingAdvice) { return s.pendingAdvice + ' pending'; }",
+        "  return 'Watching';",
         "}",
         "function renderStatus(s) {",
-        "  const host = el('status'); host.replaceChildren();",
         "  if (!s) { return; }",
-        "  const dl = document.createElement('dl');",
-        "  pair(dl, 'enabled', String(s.enabled));",
-        "  pair(dl, 'model', s.model + ' (' + s.agentType + ')');",
-        "  pair(dl, 'cadence', 'every ' + s.everyNToolCalls + ' tool calls (now ' + s.currentInterval + ')');",
-        "  pair(dl, 'block on', s.blockOnBlocker ? 'blocker' : 'nothing');",
-        "  pair(dl, 'checks run', String(s.checksRun));",
-        "  pair(dl, 'advice given', String(s.adviceDelivered));",
-        "  pair(dl, 'since last check', s.toolCallsSinceCheck + '/' + s.currentInterval);",
-        "  pair(dl, 'review in flight', s.checkInFlight ? 'yes' : 'no');",
-        "  pair(dl, 'pending advice', s.pendingAdvice || 'none');",
-        "  pair(dl, 'last error', s.lastError || 'none');",
-        "  host.appendChild(dl);",
+        "  set('phase', phaseOf(s));",
+        "  set('configuration', (s.enabled ? 'Enabled' : 'Disabled') + ' | ' + s.model + ' (' + s.agentType +",
+        "    ') | Reviews every ' + s.everyNToolCalls + ' tool calls | Blocks completion on ' +",
+        "    (s.blockOnBlocker ? 'a blocker' : 'nothing'));",
+        "  set('checks', s.checksRun);",
+        "  set('advice', s.adviceDelivered);",
+        "  set('cadence', s.toolCallsSinceCheck + '/' + s.currentInterval);",
+        "  set('pending', s.pendingAdvice ? 'Pending ' + s.pendingAdvice + ', held for the next tool call.'",
+        "    : s.checkInFlight ? 'A review is running now.' : 'No pending advice.');",
+        "  show('last-error', s.lastError ? 'Last review error: ' + s.lastError : null, true);",
+        "}",
+        "function visible() {",
+        "  const kind = el('kind').value;",
+        "  const text = el('search').value.trim().toLocaleLowerCase();",
+        "  return entries",
+        "    .filter((e) => (kind === 'all' || e.tag === kind) &&",
+        "      ((e.title || '') + ' ' + (e.detail || '')).toLocaleLowerCase().includes(text))",
+        // Newest first: the reason to open this panel is almost always the most recent thing.
+        "    .reverse();",
         "}",
         "function renderEntries() {",
+        "  const shown = visible();",
+        "  set('count', shown.length + ' of ' + entries.length);",
         "  const host = el('entries'); host.replaceChildren();",
-        "  const shown = entries.filter((e) => active.has(e.tag));",
-        "  el('empty').hidden = shown.length > 0;",
         "  for (const e of shown) {",
-        "    const li = document.createElement('li');",
-        "    li.className = 'entry'; li.dataset.tag = e.tag;",
-        "    const head = document.createElement('div'); head.className = 'head';",
-        "    const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = e.tag;",
-        "    const title = document.createElement('span'); title.className = 'title'; title.textContent = e.title || '';",
-        "    const time = document.createElement('time'); time.className = 'time'; time.textContent = e.time || '';",
-        "    head.appendChild(tag); head.appendChild(title); head.appendChild(time);",
-        "    const body = document.createElement('p'); body.className = 'detail'; body.textContent = e.detail || '';",
-        "    li.appendChild(head); li.appendChild(body); host.appendChild(li);",
+        "    const item = document.createElement('li');",
+        "    item.dataset.kind = e.tag;",
+        "    const meta = document.createElement('div');",
+        "    meta.className = 'entry-meta';",
+        // Durable entries parsed back out of the advice log have no ISO timestamp, only the
+        // locale time the log recorded, so `at` is the preferred source and `time` the fallback.
+        "    const when = e.at ? new Date(e.at).toLocaleString() : (e.time || '');",
+        "    meta.textContent = [e.tag, e.title, when].filter(Boolean).join(' | ');",
+        "    const message = document.createElement('p');",
+        "    message.className = 'entry-message';",
+        "    message.textContent = e.detail || '';",
+        "    item.append(meta, message);",
+        "    host.append(item);",
         "  }",
+        "  const empty = el('empty');",
+        "  empty.hidden = shown.length > 0;",
+        "  empty.textContent = entries.length ? 'No matching activity.' : 'No advisor activity recorded yet this session.';",
         "}",
-        "function renderBanner() {",
-        "  const b = el('banner');",
-        "  const msg = historyError ? 'Earlier advice could not be read: ' + historyError",
-        "    : historyTruncated ? 'Showing recent advice only — earlier entries exceed the display limit.' : '';",
-        "  b.hidden = !msg;",
-        "  b.className = historyError ? 'banner' : 'banner notice';",
-        "  b.textContent = msg;",
+        "function renderNotice() {",
+        "  if (historyError) { show('history', 'Earlier advice could not be read: ' + historyError, true); }",
+        "  else if (historyTruncated) { show('history', 'Showing recent advice only \\u2014 earlier entries exceed the display limit.', false); }",
+        "  else { show('history', null, false); }",
+        "  set('session', (adviceLogPath ? 'Advice log ' + adviceLogPath : 'Advice log disabled') +",
+        "    ' | Retaining up to ' + LIMIT + ' activity entries.');",
         "}",
         "function applySnapshot(snap) {",
         "  entries = Array.isArray(snap.entries) ? snap.entries : [];",
         "  historyError = snap.historyError || null;",
         "  historyTruncated = !!snap.historyTruncated;",
+        "  adviceLogPath = snap.adviceLogPath || null;",
         "  lastSeq = entries.reduce((m, e) => (e.seq > m ? e.seq : m), 0);",
-        "  renderStatus(snap.status); renderEntries(); renderBanner();",
+        "  renderStatus(snap.status); renderEntries(); renderNotice();",
         // A readiness flag rather than a sleep: the renderer test asserts on what the document
         // holds after the first snapshot, and a timing guess would be both slower and flaky.
         "  window.__advisorPanelReady = true;",
         "}",
+        "function setConn(text, ok) { const c = el('connection'); c.textContent = text; c.dataset.ok = ok ? 'yes' : 'no'; }",
         "async function load() {",
+        "  const button = el('refresh');",
+        "  button.disabled = true;",
         "  try {",
         "    const r = await fetch(BASE + 'state', { cache: 'no-store' });",
-        "    if (!r.ok) { throw new Error('HTTP ' + r.status); }",
+        "    if (!r.ok) { throw new Error('Status request failed (' + r.status + ')'); }",
         "    applySnapshot(await r.json());",
-        "    setConn('live', true);",
+        "    setConn('Live updates connected', true);",
+        "    show('error', null, true);",
         "  } catch (err) {",
-        "    setConn('disconnected \u2014 showing last known data', false);",
+        "    setConn('Disconnected \\u2014 displayed data may be stale.', false);",
+        "    show('error', err.message, true);",
+        "  } finally {",
+        "    button.disabled = false;",
         "  }",
         "}",
         "function connect() {",
         "  if (source) { source.close(); }",
         "  source = new EventSource(BASE + 'events');",
-        "  source.onopen = () => { setConn('live', true); load(); };",
-        "  source.onerror = () => setConn('disconnected \u2014 showing last known data', false);",
+        "  source.onopen = () => { setConn('Live updates connected', true); load(); };",
+        "  source.onerror = () => setConn('Disconnected \\u2014 displayed data may be stale. Reconnecting\\u2026', false);",
         "  source.addEventListener('entry', (ev) => {",
         "    const e = JSON.parse(ev.data);",
         "    if (e.seq <= lastSeq) { return; }",
         "    lastSeq = e.seq; entries.push(e);",
-        "    if (entries.length > TAGS.length * 400) { entries.splice(0, 1); }",
+        "    if (entries.length > LIMIT * 4) { entries.splice(0, 1); }",
         "    renderEntries();",
         "  });",
         "  source.addEventListener('status', (ev) => renderStatus(JSON.parse(ev.data)));",
         "  source.addEventListener('refresh', () => load());",
         "}",
-        "document.querySelectorAll('input[data-tag]').forEach((box) => {",
-        "  box.addEventListener('change', () => {",
-        "    if (box.checked) { active.add(box.dataset.tag); } else { active.delete(box.dataset.tag); }",
-        "    renderEntries();",
-        "  });",
-        "});",
+        "for (const id of ['kind', 'search']) { el(id).addEventListener('input', renderEntries); }",
         "el('refresh').addEventListener('click', load);",
+        "window.addEventListener('pagehide', () => { if (source) { source.close(); } }, { once: true });",
         "load(); connect();",
     ].join("\n");
 }
 
+// Adapted from the self-learn panel so the two read as one product: the same type scale, the
+// 880px centred column, section rules instead of full-bleed bars, restrained metric cards and
+// muted footer. Advisor-specific additions are the severity colouring on a row and the
+// connection state, which self-learn does not have to show.
 const STYLES = [
-    "body{margin:0;background:var(--background-color-default,#fff);color:var(--text-color-default,#1f2328);",
-    "font-family:var(--font-sans,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif);",
-    "font-size:var(--text-body-medium,14px);line-height:var(--leading-body-medium,20px)}",
-    ".bar{display:flex;align-items:center;gap:.5rem;padding:.75rem 1rem;border-bottom:1px solid var(--border-color-default,#d1d9e0)}",
-    "h1{font-size:var(--text-body-medium,14px);font-weight:var(--font-weight-semibold,600);margin:0;flex:1}",
-    ".pill{font-size:12px;padding:.1rem .5rem;border:1px solid var(--border-color-default,#d1d9e0);border-radius:999px;color:var(--text-color-muted,#59636e)}",
-    ".pill[data-ok='no']{color:var(--true-color-red,#c0392b);border-color:var(--true-color-red-muted,#e5a8a0)}",
-    "button{font:inherit;color:inherit;background:transparent;border:1px solid var(--border-color-default,#d1d9e0);border-radius:6px;padding:.15rem .6rem;cursor:pointer}",
+    ":root{color-scheme:light dark}",
+    "*{box-sizing:border-box}",
+    "body{margin:0;background:var(--background-color-default,#fff);color:var(--text-color-default,#202124);",
+    "font-family:var(--font-sans,system-ui,sans-serif);font-size:var(--text-body-medium,14px);line-height:1.5}",
+    "main{max-width:880px;margin:auto;padding:20px}",
+    "header,.activity-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}",
+    "header > div{min-width:0}",
+    "header button{flex-shrink:0}",
+    "h1{font-size:24px;line-height:1.3;margin:0}",
+    "h2{font-size:16px;margin:0 0 12px}",
+    "p{overflow-wrap:anywhere}",
+    ".eyebrow{margin:0 0 4px;color:var(--text-color-muted,#656d76);font-size:12px}",
+    ".muted,footer{color:var(--text-color-muted,#656d76);font-size:12px}",
+    "#connection{color:var(--text-color-muted,#656d76);font-size:12px;min-height:18px}",
+    "#connection[data-ok='no']{color:var(--true-color-red,#c62828)}",
+    "section{border-top:1px solid var(--border-color-default,#d0d7de);margin-top:20px;padding-top:20px}",
+    ".badge{font-size:12px;font-weight:normal;border:1px solid var(--border-color-default,#d0d7de);border-radius:20px;padding:3px 10px;margin-left:8px}",
+    ".metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}",
+    ".metrics div{padding:12px;border:1px solid var(--border-color-default,#d0d7de);border-radius:8px}",
+    ".metrics strong{display:block;font-size:24px;font-weight:var(--font-weight-semibold,600)}",
+    ".metrics span{color:var(--text-color-muted,#656d76);font-size:12px}",
+    ".filters{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0 16px}",
+    "label{display:flex;align-items:center;gap:8px;font-size:12px}",
+    ".search{flex:1 1 180px;min-width:0}",
+    "input{width:100%;min-width:80px}",
+    "input,select,button{font:inherit;color:inherit;background:var(--background-color-default,#fff);",
+    "border:1px solid var(--border-color-default,#d0d7de);border-radius:6px;padding:7px 10px}",
+    "button{cursor:pointer}",
+    "button:disabled{opacity:.6;cursor:wait}",
     ":focus-visible{outline:2px solid var(--color-focus-outline,#0969da);outline-offset:2px}",
-    ".status{padding:.5rem 1rem;border-bottom:1px solid var(--border-color-default,#d1d9e0)}",
-    ".status dl{display:grid;grid-template-columns:max-content 1fr;gap:.1rem .75rem;margin:0}",
-    ".status dt{color:var(--text-color-muted,#59636e)}",
-    ".status dd{margin:0;font-family:var(--font-mono,ui-monospace,monospace)}",
-    ".banner{margin:.5rem 1rem;padding:.5rem .75rem;border:1px solid var(--true-color-red-muted,#e5a8a0);border-radius:6px;color:var(--true-color-red,#c0392b)}",
-    ".banner.notice{border-color:var(--true-color-border,#d0d7de);color:var(--true-color-text-secondary,#57606a)}",
-    ".filters{display:flex;flex-wrap:wrap;gap:.75rem;padding:.5rem 1rem;border-bottom:1px solid var(--border-color-default,#d1d9e0);color:var(--text-color-muted,#59636e)}",
-    ".filters label{display:flex;align-items:center;gap:.25rem}",
-    ".entries{list-style:none;margin:0;padding:0}",
-    ".entry{padding:.6rem 1rem;border-bottom:1px solid var(--border-color-default,#d1d9e0)}",
-    ".head{display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}",
-    ".tag{font-size:11px;text-transform:uppercase;letter-spacing:.04em;font-weight:var(--font-weight-semibold,600);padding:.05rem .4rem;border:1px solid var(--border-color-default,#d1d9e0);border-radius:4px}",
-    ".entry[data-tag='blocker'] .tag{color:var(--true-color-red,#c0392b);border-color:var(--true-color-red-muted,#e5a8a0)}",
-    ".entry[data-tag='error'] .tag{color:var(--true-color-red,#c0392b);border-color:var(--true-color-red-muted,#e5a8a0)}",
-    ".entry[data-tag='control'] .tag{color:var(--true-color-blue,#0969da);border-color:var(--true-color-blue-muted,#a3c4e8)}",
-    ".title{flex:1;min-width:0;overflow-wrap:anywhere}",
-    ".time{color:var(--text-color-muted,#59636e);font-size:12px;font-variant-numeric:tabular-nums}",
+    "ol{list-style:none;padding:0}",
+    "li{border-bottom:1px solid var(--border-color-default,#d0d7de);padding:8px 0 12px;margin-bottom:12px}",
+    // Severity is the advisor's whole point, so it colours the row's meta line. The reference
+    // panel colours errors the same way; these are the same rule with more kinds.
+    "li[data-kind='blocker'] .entry-meta,li[data-kind='error'] .entry-meta{color:var(--true-color-red,#c62828)}",
+    "li[data-kind='control'] .entry-meta{color:var(--true-color-blue,#0969da)}",
+    ".entry-meta{color:var(--text-color-muted,#656d76);font-size:12px}",
     // Advice notes carry paths, hashes and stack frames — unbroken runs far longer than a side
     // panel is wide. Without `anywhere` they do not wrap and the whole panel scrolls sideways.
-    ".detail{margin:.3rem 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-mono,ui-monospace,monospace)}",
-    ".muted{color:var(--text-color-muted,#59636e);padding:1rem}",
+    ".entry-message{white-space:pre-wrap;overflow-wrap:anywhere;margin:5px 0 0}",
+    ".error{color:var(--true-color-red,#c62828)}",
+    "footer{border-top:1px solid var(--border-color-default,#d0d7de);margin-top:24px;padding-top:8px}",
+    "@media (max-width:360px){main{padding:12px}.metrics{gap:6px}.metrics div{padding:8px}header{align-items:flex-start}}",
+    "@media (prefers-color-scheme:dark){",
+    "body{background:var(--background-color-default,#181818);color:var(--text-color-default,#e5e5e5)}",
+    "input,select,button{background:var(--background-color-default,#181818)}",
+    ".muted,footer,.eyebrow,#connection,.metrics span,.entry-meta{color:var(--text-color-muted,#a6adb4)}",
+    ".error,#connection[data-ok='no'],li[data-kind='blocker'] .entry-meta,li[data-kind='error'] .entry-meta{color:var(--true-color-red,#ff8c8c)}",
+    "}",
 ].join("");
+
+const TAG_LABELS = {
+    blocker: "Blockers",
+    concern: "Concerns",
+    nit: "Nits",
+    review: "Reviews",
+    control: "Control changes",
+    error: "Errors",
+};
 
 /** The canvas document. `basePath` carries the per-server token, so it is never a constant. */
 export function renderPanelHtml({ basePath, title = "Advisor activity", nonce = "" }) {
-    const filters = PANEL_TAGS.map(
-        (tag) =>
-            `<label><input type="checkbox" data-tag="${escapeHtml(tag)}" checked /> ${escapeHtml(tag)}</label>`,
-    ).join("");
+    const options = [
+        `<option value="all">All activity</option>`,
+        ...PANEL_TAGS.map(
+            (tag) => `<option value="${escapeHtml(tag)}">${escapeHtml(TAG_LABELS[tag] ?? tag)}</option>`,
+        ),
+    ].join("");
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -354,17 +415,39 @@ export function renderPanelHtml({ basePath, title = "Advisor activity", nonce = 
 <style nonce="${nonce}">${STYLES}</style>
 </head>
 <body>
-<header class="bar">
-  <h1>${escapeHtml(title)}</h1>
-  <span id="conn" class="pill" data-ok="no">connecting\u2026</span>
-  <button id="refresh" type="button">Refresh</button>
-</header>
-<section id="status" class="status" aria-live="polite" aria-label="Advisor status"></section>
-<div id="banner" class="banner" role="status" hidden></div>
-<nav class="filters" aria-label="Filter by severity">${filters}</nav>
 <main>
-  <ol id="entries" class="entries" aria-label="Advisor activity"></ol>
-  <p id="empty" class="muted">No advisor activity recorded yet this session.</p>
+  <header>
+    <div><p class="eyebrow">Session reviewer</p><h1>${escapeHtml(title)}</h1></div>
+    <button id="refresh" type="button">Refresh</button>
+  </header>
+  <p id="connection" role="status" aria-live="polite" data-ok="no">Connecting\u2026</p>
+  <p id="error" class="error" role="alert" hidden></p>
+  <p id="history" class="muted" role="status" hidden></p>
+  <section aria-labelledby="status-title">
+    <h2 id="status-title">Current status <span id="phase" class="badge">Loading</span></h2>
+    <p id="configuration"></p>
+    <div class="metrics">
+      <div><strong id="checks">-</strong><span>Reviews</span></div>
+      <div><strong id="advice">-</strong><span>Advice delivered</span></div>
+      <div><strong id="cadence">-</strong><span>Tool calls since review</span></div>
+    </div>
+    <p class="muted">Counters are since this extension loaded; advice below survives reloads.</p>
+    <p id="pending"></p>
+    <p id="last-error" class="error" hidden></p>
+  </section>
+  <section aria-labelledby="activity-title">
+    <div class="activity-heading"><h2 id="activity-title">Recent activity</h2><span id="count" class="muted"></span></div>
+    <div class="filters">
+      <label>Show <select id="kind">${options}</select></label>
+      <label class="search">Search <input id="search" type="search" placeholder="Filter advice" /></label>
+    </div>
+    <p id="empty" class="muted">Waiting for activity\u2026</p>
+    <ol id="entries" aria-label="Advisor activity, newest first"></ol>
+  </section>
+  <footer>
+    <p>This panel is read-only. Ask the agent for advisor status, the advice log, or a review. Changing the advisor still requires the existing confirmation dialog.</p>
+    <p id="session" class="muted"></p>
+  </footer>
 </main>
 <script nonce="${nonce}">${clientScript(basePath)}</script>
 </body>
