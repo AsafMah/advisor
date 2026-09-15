@@ -113,6 +113,9 @@ function createHost(sessionId) {
         removed,
         startedAgents,
         logs: [],
+        // Every `session.send` the extension makes. A settings change must produce none: a
+        // prompt is a turn, and moving a slider is not the user speaking.
+        sends: [],
         verdict: null,
         registered: null,
     };
@@ -133,7 +136,9 @@ function createHost(sessionId) {
         async log(text) {
             host.logs.push(text);
         },
-        async send() {},
+        async send(prompt, options) {
+            host.sends.push({ prompt, options });
+        },
         async getEvents() {
             return events.slice();
         },

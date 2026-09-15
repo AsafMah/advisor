@@ -115,7 +115,7 @@ async function launchBrowser() {
     };
 }
 
-async function withRenderedPanel(run, entries = []) {
+async function withRenderedPanel(run, entries = [], options = {}) {
     const log = createActivityLog();
     for (const entry of entries) log.push(entry);
     const status = {
@@ -132,11 +132,34 @@ async function withRenderedPanel(run, entries = []) {
         pendingAdvice: null,
         lastError: null,
     };
+    // Stands in for the extension's own apply: the same contract, over a status object the test
+    // can read afterwards to see whether the write actually happened.
+    const applied = [];
+    const settingsOf = () => ({
+        enabled: status.enabled,
+        model: status.model,
+        everyNToolCalls: status.everyNToolCalls,
+    });
+    const applySettings =
+        options.applySettings ??
+        ((req) => {
+            applied.push(req);
+            const current = settingsOf();
+            const drifted = Object.keys(current).filter((k) => req.expected[k] !== current[k]);
+            if (drifted.length > 0) {
+                return { ok: false, code: "stale", message: `changed elsewhere (${drifted.join(", ")})`, settings: current, status };
+            }
+            const changed = Object.keys(current).filter((k) => req.desired[k] !== current[k]);
+            Object.assign(status, req.desired);
+            status.currentInterval = status.everyNToolCalls;
+            return { ok: true, applied: changed, settings: settingsOf(), status };
+        });
     const panel = await createPanelServer({
         title: "Advisor activity",
         getSnapshot: () => ({ status, entries: log.list(), historyError: null, historyTruncated: false }),
         getStatus: () => status,
         subscribe: log.subscribe,
+        applySettings,
         statusIntervalMs: 200,
         onError: () => {},
     });
@@ -151,7 +174,7 @@ async function withRenderedPanel(run, entries = []) {
             if (Date.now() > deadline) throw new Error("the panel never finished its first render");
             await delay(50);
         }
-        await run({ browser, panel, log });
+        await run({ browser, panel, log, status, applied, settingsOf });
     } finally {
         await browser.close();
         await panel.close();
@@ -368,4 +391,189 @@ if (!EDGE) {
             );
         });
     }
+
+    // --- settings -----------------------------------------------------------------------------
+
+    const edit = (field, value) =>
+        "(() => { const n = document.getElementById('set-" +
+        field +
+        "'); " +
+        (field === "enabled" ? "n.checked = " : "n.value = ") +
+        JSON.stringify(value) +
+        "; n.dispatchEvent(new Event('input', { bubbles: true })); n.dispatchEvent(new Event('change', { bubbles: true })); return true; })()";
+
+    const click = (id) => "(() => { document.getElementById('" + id + "').click(); return true; })()";
+    const text = (id) => "document.getElementById('" + id + "').textContent";
+    const hidden = (id) => "document.getElementById('" + id + "').hidden";
+
+    test("the settings form seeds from the advisor and hides its controls until edited", async () => {
+        await withRenderedPanel(async ({ browser }) => {
+            assert.equal(await browser.evaluate("document.getElementById('set-enabled').checked"), true);
+            assert.equal(await browser.evaluate("document.getElementById('set-model').value"), "gpt-5.6-terra");
+            assert.equal(await browser.evaluate("document.getElementById('set-cadence').value"), "6");
+            assert.equal(await browser.evaluate(hidden("settings-actions")), true, "an untouched form offers nothing");
+        });
+    });
+
+    test("reviewing a change shows the exact edit and sends nothing", async () => {
+        await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
+            await browser.evaluate(edit("cadence", "9"));
+            assert.equal(await browser.evaluate(hidden("settings-actions")), false);
+            await browser.evaluate(click("settings-review"));
+            await delay(100);
+
+            const lines = await browser.evaluate(
+                "Array.from(document.querySelectorAll('#settings-diff li')).map(e => e.textContent)",
+            );
+            assert.deepEqual(lines, ["Review cadence: every 6 tool calls \u2192 every 9 tool calls"]);
+            assert.equal(applied.length, 0, "reviewing must not reach the extension");
+            assert.equal(settingsOf().everyNToolCalls, 6);
+        });
+    });
+
+    test("cancelling the confirmation applies nothing and keeps the edit", async () => {
+        await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
+            await browser.evaluate(edit("model", "claude-opus-5"));
+            await browser.evaluate(click("settings-review"));
+            await delay(100);
+            await browser.evaluate(click("settings-cancel"));
+            await delay(100);
+
+            assert.equal(applied.length, 0, "cancel must send nothing");
+            assert.equal(settingsOf().model, "gpt-5.6-terra");
+            assert.equal(await browser.evaluate(hidden("settings-confirm")), true);
+            assert.match(await browser.evaluate(text("settings-result")), /cancelled/i);
+            assert.equal(
+                await browser.evaluate("document.getElementById('set-model').value"),
+                "claude-opus-5",
+                "cancelling an apply is not discarding what was typed",
+            );
+        });
+    });
+
+    test("resetting discards the edit without sending anything", async () => {
+        await withRenderedPanel(async ({ browser, applied }) => {
+            await browser.evaluate(edit("cadence", "12"));
+            await browser.evaluate(click("settings-reset"));
+            await delay(100);
+
+            assert.equal(applied.length, 0);
+            assert.equal(await browser.evaluate("document.getElementById('set-cadence').value"), "6");
+            assert.equal(await browser.evaluate(hidden("settings-actions")), true);
+        });
+    });
+
+    test("applying sends one request and reports what landed", async () => {
+        await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
+            await browser.evaluate(edit("cadence", "9"));
+            await browser.evaluate(edit("enabled", false));
+            await browser.evaluate(click("settings-review"));
+            await delay(100);
+            await browser.evaluate(click("settings-apply"));
+            await delay(400);
+
+            assert.equal(applied.length, 1, "exactly one write per Apply");
+            assert.deepEqual(applied[0].desired, { enabled: false, model: "gpt-5.6-terra", everyNToolCalls: 9 });
+            assert.deepEqual(settingsOf(), { enabled: false, model: "gpt-5.6-terra", everyNToolCalls: 9 });
+            assert.match(await browser.evaluate(text("settings-result")), /Applied:/);
+            assert.equal(await browser.evaluate(hidden("settings-actions")), true, "a landed change is no longer dirty");
+            assert.equal(await browser.evaluate(text("phase")), "Disabled", "and the status must follow");
+        });
+    });
+
+    test("a refused change says so and leaves the form alone", async () => {
+        await withRenderedPanel(
+            async ({ browser, settingsOf }) => {
+                await browser.evaluate(edit("cadence", "9"));
+                await browser.evaluate(click("settings-review"));
+                await delay(100);
+                await browser.evaluate(click("settings-apply"));
+                await delay(400);
+
+                assert.match(await browser.evaluate(text("settings-result")), /Not applied/);
+                assert.match(await browser.evaluate(text("settings-result")), /somebody else/);
+                assert.equal(settingsOf().everyNToolCalls, 6);
+                assert.equal(await browser.evaluate("document.getElementById('set-cadence').value"), "9");
+            },
+            [],
+            {
+                applySettings: () => ({
+                    ok: false,
+                    code: "stale",
+                    message: "somebody else moved it",
+                    settings: { enabled: true, model: "gpt-5.6-terra", everyNToolCalls: 6 },
+                }),
+            },
+        );
+    });
+
+    test("a change made elsewhere while editing is surfaced, not silently merged", async () => {
+        await withRenderedPanel(async ({ browser, status }) => {
+            await browser.evaluate(edit("model", "claude-opus-5"));
+            // The advisor moves underneath the open form; the status poll carries it in.
+            status.everyNToolCalls = 20;
+            status.currentInterval = 20;
+            await delay(700);
+
+            assert.equal(
+                await browser.evaluate("document.getElementById('set-model').value"),
+                "claude-opus-5",
+                "a live update must not overwrite what the user is typing",
+            );
+            assert.equal(await browser.evaluate(hidden("settings-note")), false);
+            assert.match(await browser.evaluate(text("settings-note")), /changed elsewhere/i);
+        });
+    });
+
+    test("an untouched form follows the advisor", async () => {
+        await withRenderedPanel(async ({ browser, status }) => {
+            status.everyNToolCalls = 20;
+            status.currentInterval = 20;
+            await delay(700);
+
+            assert.equal(await browser.evaluate("document.getElementById('set-cadence').value"), "20");
+            assert.equal(await browser.evaluate(hidden("settings-note")), true);
+        });
+    });
+
+    test("a lost response locks the form rather than claiming nothing happened", async () => {
+        // The write reaches the extension and lands; only the answer is lost. Saying "not
+        // applied" there would be a guess, and letting Cancel or Reset redraw the pre-write
+        // values would dress that guess up as the current state.
+        await withRenderedPanel(async ({ browser, applied, settingsOf }) => {
+            await browser.evaluate(
+                "(() => { const real = window.fetch.bind(window); window.__realFetch = real;" +
+                    " window.fetch = async (...a) => { const r = await real(...a);" +
+                    " if (String(a[0]).endsWith('settings')) { await r.text(); throw new TypeError('connection lost'); } return r; }; return true; })()",
+            );
+            await browser.evaluate(edit("cadence", "9"));
+            await browser.evaluate(click("settings-review"));
+            await delay(100);
+            await browser.evaluate(click("settings-apply"));
+            await delay(400);
+
+            assert.equal(applied.length, 1, "the write really did reach the extension");
+            assert.equal(settingsOf().everyNToolCalls, 9, "and really did land");
+            assert.match(await browser.evaluate(text("settings-result")), /Outcome unknown/);
+            assert.equal(await browser.evaluate("document.getElementById('set-cadence').disabled"), true);
+            assert.equal(await browser.evaluate("document.getElementById('settings-review').disabled"), true);
+
+            // Cancel and Reset must not overwrite the uncertainty with a comforting claim.
+            await browser.evaluate(click("settings-cancel"));
+            await browser.evaluate(click("settings-reset"));
+            await delay(100);
+            assert.match(await browser.evaluate(text("settings-result")), /Outcome unknown/);
+            assert.equal(applied.length, 1, "a locked form must not resubmit");
+
+            // Only reading the real state resolves it; `fetch` is an own property of the global
+            // here, so restore the saved original rather than deleting the override.
+            await browser.evaluate("(() => { window.fetch = window.__realFetch; return true; })()");
+            await browser.evaluate(click("refresh"));
+            await delay(500);
+
+            assert.match(await browser.evaluate(text("settings-result")), /Reloaded/);
+            assert.equal(await browser.evaluate("document.getElementById('set-cadence').disabled"), false);
+            assert.equal(await browser.evaluate("document.getElementById('set-cadence').value"), "9");
+        });
+    });
 }

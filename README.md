@@ -231,6 +231,26 @@ Activity is listed newest first and narrowed by two filters that compose: a chec
 several severities can be watched at once, and a free-text search over titles and notes. The layout
 deliberately mirrors the self-learn activity panel so the two read as one product.
 
+### Changing settings from the panel
+
+The panel can change three things for the running session: whether the advisor is enabled, the
+review model, and the review cadence. Everything else — the policy knobs, `reload_config`, starting
+a review — stays with the command and the tool, because those are either the model's business or a
+decision this UI has no way to confirm safely.
+
+The flow is edit, then **Review**, which shows the exact before-and-after of every field that
+changed, then **Apply** or **Cancel**. Nothing is sent until Apply; Cancel sends nothing and keeps
+what was typed. Applying starts no review and sends no message: it changes the session's settings
+and nothing else. The changes are session overrides only and never touch the config file, and they
+are recorded in the activity feed as coming from the panel, separately from the same change made by
+a slash command or by the tool — the tool is the model asking, and the model is the thing under
+review.
+
+Applies are atomic and checked against the state the form was filled from, so a setting changed
+elsewhere while the confirmation was open is refused rather than quietly overwritten. If a reply is
+lost in flight the panel says the outcome is **unknown** and locks the form rather than claiming
+nothing happened; only a successful refresh resolves it.
+
 Opening it is up to you — the extension never opens it for you. There are no OS notifications.
 
 [cmd-issue]: https://github.com/github/app/issues/3056

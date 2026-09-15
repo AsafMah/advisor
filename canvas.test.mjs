@@ -533,3 +533,181 @@ test("the panel reports live status, not a cached ready state", async () => {
         await host.closeCanvas("panel-1");
     }
 });
+
+// --- settings through the panel ---------------------------------------------------------------
+
+/** The panel's own view of the advisor: the same `/state` its renderer reads. */
+async function panelState(url) {
+    const res = await fetch(new URL("state", url), { headers: { Origin: new URL(url).origin } });
+    assert.equal(res.status, 200);
+    return res.json();
+}
+
+const settingsOf = (status) => ({
+    enabled: status.enabled,
+    model: status.model,
+    everyNToolCalls: status.everyNToolCalls,
+});
+
+const baseline = async (url) => settingsOf((await panelState(url)).status);
+
+/** Posts to a live panel's settings route the way its own document does. */
+async function postSettings(url, body, { origin, contentType = "application/json" } = {}) {
+    const headers = { Origin: origin ?? new URL(url).origin };
+    if (contentType !== null) headers["Content-Type"] = contentType;
+    const res = await fetch(new URL("settings", url), { method: "POST", headers, body: JSON.stringify(body) });
+    return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+async function withPanel(run, options) {
+    const host = await bootExtension(options);
+    const { url } = await host.openCanvas("panel-1");
+    try {
+        await run({ host, url });
+    } finally {
+        await host.closeCanvas("panel-1");
+    }
+}
+
+test("the panel applies all three settings at once", async () => {
+    await withPanel(async ({ url }) => {
+        const expected = await baseline(url);
+        const desired = { enabled: false, model: "claude-opus-5", everyNToolCalls: 11 };
+        const { status, json } = await postSettings(url, { expected, desired });
+
+        assert.equal(status, 200, JSON.stringify(json));
+        assert.equal(json.ok, true);
+        assert.deepEqual([...json.applied].sort(), ["enabled", "everyNToolCalls", "model"]);
+        assert.deepEqual(await baseline(url), desired);
+        assert.deepEqual(settingsOf(json.status), desired, "the response must carry the state it just produced");
+    });
+});
+
+test("a settings change through the panel starts no review and sends no message", async () => {
+    // The panel is a control surface, not a prompt. A change that queued a review would make
+    // adjusting a setting cost a model call; one that sent a message would put words in the
+    // user's mouth, which is the failure this extension has already been bitten by once.
+    await withPanel(async ({ host, url }) => {
+        const before = await baseline(url);
+        await postSettings(url, { expected: before, desired: { ...before, everyNToolCalls: 4 } });
+        await host.quiesce();
+
+        assert.equal(host.startedAgents.length, 0, "no sub-agent may be started by a settings change");
+        assert.equal(host.sends.length, 0, "no user message may be synthesised by a settings change");
+        assert.equal((await panelState(url)).status.checksRun, 0, "no review may be run by a settings change");
+    });
+});
+
+test("the panel never asks the host to confirm", async () => {
+    // A confirmation raised from an idle HTTP callback has no turn to belong to. The panel
+    // confirms in its own document instead, before the request is ever made.
+    await withPanel(async ({ host, url }) => {
+        const asked = withConfirm(host, true);
+        const before = await baseline(url);
+
+        await postSettings(url, { expected: before, desired: { ...before, enabled: false } });
+
+        assert.deepEqual(asked, [], "the panel must not raise a host dialog");
+        assert.equal((await baseline(url)).enabled, false, "and must still have applied the change");
+    });
+});
+
+test("the tool still confirms after the panel route exists", async () => {
+    // The panel bypassing `confirmChange` must not have weakened the path the model uses.
+    await withPanel(async ({ host, url }) => {
+        const asked = withConfirm(host, false);
+        await host.callTool("advisor_control", { operation: "disable" });
+
+        assert.equal(asked.length, 1);
+        assert.equal((await baseline(url)).enabled, true, "a declined tool change must still apply nothing");
+    });
+});
+
+test("a stale baseline is refused and changes nothing", async () => {
+    await withPanel(async ({ host, url }) => {
+        const stale = await baseline(url);
+        // Something else moves the cadence while the confirmation is on screen.
+        withConfirm(host, true);
+        await host.callTool("advisor_control", { operation: "set_cadence", everyNToolCalls: 3 });
+
+        const { status, json } = await postSettings(url, { expected: stale, desired: { ...stale, model: "gpt-5.4" } });
+
+        assert.equal(status, 409);
+        assert.equal(json.code, "stale");
+        const now = await baseline(url);
+        assert.equal(now.everyNToolCalls, 3, "the other change must survive");
+        assert.equal(now.model, stale.model, "the refused change must not have landed");
+        assert.equal(json.settings.everyNToolCalls, 3, "the refusal must hand back the truth to retry against");
+    });
+});
+
+test("one invalid field applies none of them", async () => {
+    await withPanel(async ({ url }) => {
+        const before = await baseline(url);
+        const { status, json } = await postSettings(url, {
+            expected: before,
+            desired: { enabled: false, model: "claude-opus-5", everyNToolCalls: 0 },
+        });
+
+        assert.equal(status, 400);
+        assert.equal(json.code, "invalid");
+        assert.deepEqual(await baseline(url), before, "a rejected write must leave every field alone");
+    });
+});
+
+test("a settings write is recorded as the panel's, distinctly from the tool's", async () => {
+    await withPanel(async ({ host, url }) => {
+        const before = await baseline(url);
+        await postSettings(url, { expected: before, desired: { ...before, enabled: false } });
+        withConfirm(host, true);
+        await host.callTool("advisor_control", { operation: "enable" });
+
+        const control = (await panelState(url)).entries.filter((e) => e.tag === "control");
+        const fromPanel = control.find((e) => e.source === "panel");
+        const fromTool = control.find((e) => e.source === "tool");
+
+        assert.ok(fromPanel, "a human change through the panel must be attributable to it");
+        assert.ok(fromTool, "a change the model asked for must stay attributable to the tool");
+        assert.match(fromPanel.detail, /activity panel/);
+        assert.match(fromTool.detail, /advisor_control tool/);
+    });
+});
+
+test("the panel cannot reach settings the increment did not give it", async () => {
+    await withPanel(async ({ url }) => {
+        const before = (await panelState(url)).status;
+        const { status } = await postSettings(url, {
+            expected: settingsOf(before),
+            desired: { ...settingsOf(before), blockOnBlocker: false },
+        });
+        assert.equal(status, 400);
+        assert.equal((await panelState(url)).status.blockOnBlocker, before.blockOnBlocker);
+    });
+});
+
+test("a cross-origin settings write is refused by the live panel", async () => {
+    await withPanel(async ({ url }) => {
+        const before = await baseline(url);
+        const { status } = await postSettings(
+            url,
+            { expected: before, desired: { ...before, enabled: false } },
+            { origin: "http://evil.example" },
+        );
+        assert.equal(status, 403);
+        assert.deepEqual(await baseline(url), before);
+    });
+});
+
+test("reading and previewing settings changes nothing", async () => {
+    // The confirmation step is entirely in the renderer, so nothing short of Apply reaches the
+    // extension. This records that the read path really is free of side effects.
+    await withPanel(async ({ host, url }) => {
+        const before = await baseline(url);
+        await panelState(url);
+        await panelState(url);
+        await host.quiesce(50);
+
+        assert.deepEqual(await baseline(url), before);
+        assert.equal((await panelState(url)).entries.filter((e) => e.tag === "control").length, 0);
+    });
+});

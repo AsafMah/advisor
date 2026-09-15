@@ -80,6 +80,72 @@ export function boundBySerializedBytes(entries, maxBytes = MAX_PAYLOAD_BYTES) {
 export const ADVICE_TAGS = ["blocker", "concern", "nit"];
 export const PANEL_TAGS = [...ADVICE_TAGS, "review", "control", "error"];
 
+// The only three things the panel may change, and the only three it may be told about. Anything
+// outside this list is rejected rather than ignored: a request carrying a field this endpoint
+// does not implement is a request that thinks it is doing something, and answering 200 to it
+// would be a lie.
+export const SETTINGS_KEYS = ["enabled", "model", "everyNToolCalls"];
+export const MAX_SETTINGS_BODY_BYTES = 4 * 1024;
+const MAX_MODEL_LENGTH = 200;
+const MAX_CADENCE = 10000;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+function validateSettings(value, label) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return `${label} must be an object`;
+    for (const key of Object.keys(value)) {
+        if (!SETTINGS_KEYS.includes(key)) return `${label}.${key} is not a setting this panel can change`;
+    }
+    for (const key of SETTINGS_KEYS) {
+        if (!(key in value)) return `${label}.${key} is missing`;
+    }
+    if (typeof value.enabled !== "boolean") return `${label}.enabled must be true or false`;
+    if (typeof value.model !== "string") return `${label}.model must be a string`;
+    const model = value.model.trim();
+    if (!model) return `${label}.model must not be empty`;
+    if (model.length > MAX_MODEL_LENGTH) return `${label}.model is longer than ${MAX_MODEL_LENGTH} characters`;
+    if (CONTROL_CHARS.test(model)) return `${label}.model contains a control character`;
+    // `Number.isInteger` rejects NaN, Infinity and 7.5 in one go. JSON has no integer type, so
+    // this is the only place the distinction can be made.
+    if (!Number.isInteger(value.everyNToolCalls)) return `${label}.everyNToolCalls must be a whole number`;
+    if (value.everyNToolCalls < 1 || value.everyNToolCalls > MAX_CADENCE) {
+        return `${label}.everyNToolCalls must be between 1 and ${MAX_CADENCE}`;
+    }
+    return null;
+}
+
+/**
+ * Validates a settings write from the panel, before anything can act on it.
+ *
+ * `expected` is the baseline the user was looking at when they confirmed, and it is required
+ * rather than optional: without it a confirmation dialog listing "cadence 6 → 8" can be applied
+ * long after something else moved the cadence, and the change the user approved is not the change
+ * that happens. Whether the baseline still holds is the caller's question, not this one's — here
+ * it only has to be present and well-formed.
+ *
+ * Returns `{ request }` or `{ error }`; never throws.
+ */
+export function parseSettingsRequest(text) {
+    let body;
+    try {
+        body = JSON.parse(text);
+    } catch {
+        return { error: "the request body is not valid JSON" };
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return { error: "the request body must be a JSON object" };
+    }
+    for (const key of Object.keys(body)) {
+        if (key !== "expected" && key !== "desired") return { error: `${key} is not a field this endpoint accepts` };
+    }
+    for (const key of ["expected", "desired"]) {
+        if (!(key in body)) return { error: `${key} is missing` };
+    }
+    const problem = validateSettings(body.expected, "expected") ?? validateSettings(body.desired, "desired");
+    if (problem) return { error: problem };
+    const pick = (o) => ({ enabled: o.enabled, model: o.model.trim(), everyNToolCalls: o.everyNToolCalls });
+    return { request: { expected: pick(body.expected), desired: pick(body.desired) } };
+}
+
 /**
  * The in-memory record of this session's advisor activity, and the thing the panel subscribes to.
  *
@@ -247,6 +313,158 @@ function clientScript(basePath) {
         "  set('pending', s.pendingAdvice ? 'Pending ' + s.pendingAdvice + ', held for the next tool call.'",
         "    : s.checkInFlight ? 'A review is running now.' : 'No pending advice.');",
         "  show('last-error', s.lastError ? 'Last review error: ' + s.lastError : null, true);",
+        "  renderSettings(s);",
+        "}",
+        // The settings form is the one part of the panel the user writes through, so it holds two
+        // pieces of state the rest does not need: `base`, the values the server last confirmed,
+        // and `dirty`, whether the user has typed since. `base` is what gets sent as `expected`,
+        // which is how a change made elsewhere while the confirmation was on screen gets refused
+        // instead of silently overwriting it.
+        "let base = null;",
+        "let dirty = false;",
+        "let pending = null;",
+        "const UNKNOWN = 'Outcome unknown \\u2014 the change may or may not have been applied. Refresh to see the current settings.';",
+        // The edit controls only appear once there is an edit to act on, so an untouched panel
+        // reads as the status display it mostly is.
+        "function updateDirty() { el('settings-actions').hidden = !(dirty || unknown); }",
+        // A request that left this document and did not come back leaves the panel with no idea
+        // what the advisor now holds. The honest response is to stop pretending: the form locks,
+        // so a second Apply cannot land on top of a change that may already have happened, and
+        // Reset cannot quietly redraw the pre-write values as though they were current. Only a
+        // successful read of the real state clears it.
+        "let unknown = false;",
+        "function setUnknown(on) {",
+        "  unknown = on;",
+        "  for (const id of ['set-enabled', 'set-model', 'set-cadence', 'settings-review', 'settings-reset']) {",
+        "    el(id).disabled = on;",
+        "  }",
+        "  updateDirty();",
+        "}",
+        "function settingsOf(s) {",
+        "  return { enabled: !!s.enabled, model: String(s.model || ''), everyNToolCalls: Number(s.everyNToolCalls) };",
+        "}",
+        "function sameSettings(a, b) {",
+        "  return !!a && !!b && a.enabled === b.enabled && a.model === b.model && a.everyNToolCalls === b.everyNToolCalls;",
+        "}",
+        "function fillForm(s) {",
+        "  el('set-enabled').checked = s.enabled;",
+        "  el('set-model').value = s.model;",
+        "  el('set-cadence').value = String(s.everyNToolCalls);",
+        "}",
+        "function readForm() {",
+        "  return {",
+        "    enabled: el('set-enabled').checked,",
+        "    model: el('set-model').value.trim(),",
+        "    everyNToolCalls: Number(el('set-cadence').value),",
+        "  };",
+        "}",
+        "function describe(key, value) {",
+        "  if (key === 'enabled') { return value ? 'enabled' : 'disabled'; }",
+        "  if (key === 'everyNToolCalls') { return 'every ' + value + ' tool calls'; }",
+        "  return String(value);",
+        "}",
+        "const SETTING_LABELS = { enabled: 'Advisor', model: 'Model', everyNToolCalls: 'Review cadence' };",
+        "function diffSettings(from, to) {",
+        "  const out = [];",
+        "  for (const key of ['enabled', 'model', 'everyNToolCalls']) {",
+        "    if (from[key] !== to[key]) { out.push(SETTING_LABELS[key] + ': ' + describe(key, from[key]) + ' \\u2192 ' + describe(key, to[key])); }",
+        "  }",
+        "  return out;",
+        "}",
+        "function settingsResult(text, ok) {",
+        "  const node = el('settings-result');",
+        "  node.textContent = text || '';",
+        "  node.hidden = !text;",
+        "  node.dataset.ok = ok ? 'yes' : 'no';",
+        "  node.className = ok ? 'muted' : 'error';",
+        "}",
+        "function closeConfirm() { pending = null; el('settings-confirm').hidden = true; }",
+        // A push from the server must not overwrite what the user is halfway through typing, and
+        // must not be hidden from them either. So an edited form keeps its values and gains a
+        // notice; an untouched one just follows the advisor.
+        "function renderSettings(s) {",
+        "  const next = settingsOf(s);",
+        "  if (sameSettings(base, next)) { return; }",
+        "  const first = base === null;",
+        "  base = next;",
+        "  if (first || !(dirty || pending)) { fillForm(next); show('settings-note', null, false); return; }",        "  show('settings-note', 'The advisor changed elsewhere while you were editing. Your edits are kept \\u2014 review them again before applying.', false);",
+        "}",
+        "function validateForm(desired) {",
+        "  if (!desired.model) { return 'Model must not be empty.'; }",
+        "  if (!Number.isInteger(desired.everyNToolCalls) || desired.everyNToolCalls < 1) {",
+        "    return 'Review cadence must be a whole number of at least 1.';",
+        "  }",
+        "  return null;",
+        "}",
+        // Two steps on purpose: nothing is sent until the exact change has been shown back and
+        // accepted. The confirmation is this document's own, not a host dialog, so reviewing a
+        // change costs the session nothing and starts no turn.
+        "function reviewSettings(ev) {",
+        "  if (ev) { ev.preventDefault(); }",
+        "  if (unknown) { return; }",
+        "  settingsResult(null, true);",
+        "  if (!base) { settingsResult('Not applied \\u2014 current settings are not loaded yet.', false); return; }",
+        "  const desired = readForm();",
+        "  const problem = validateForm(desired);",
+        "  if (problem) { closeConfirm(); settingsResult('Not applied \\u2014 ' + problem, false); return; }",
+        "  const lines = diffSettings(base, desired);",
+        "  if (lines.length === 0) { closeConfirm(); settingsResult('Nothing to change.', true); return; }",
+        "  pending = desired;",
+        "  const list = el('settings-diff'); list.replaceChildren();",
+        "  for (const line of lines) { const li = document.createElement('li'); li.textContent = line; list.append(li); }",
+        "  el('settings-confirm').hidden = false;",
+        "  el('settings-apply').focus();",
+        "}",
+        "function resetSettings() {",
+        "  if (unknown) { return; }",
+        "  closeConfirm();",
+        "  dirty = false;",
+        "  if (base) { fillForm(base); }",
+        "  show('settings-note', null, false);",
+        "  settingsResult(null, true);",
+        "  updateDirty();",
+        "}",
+        "async function applySettings() {",
+        "  if (!pending || !base) { return; }",
+        "  const desired = pending;",
+        "  const button = el('settings-apply');",
+        "  button.disabled = true;",
+        "  try {",
+        "    const r = await fetch(BASE + 'settings', {",
+        "      method: 'POST',",
+        "      cache: 'no-store',",
+        "      headers: { 'Content-Type': 'application/json' },",
+        "      body: JSON.stringify({ expected: base, desired: desired }),",
+        "    });",
+        "    const body = await r.json().catch(() => null);",
+        "    closeConfirm();",
+        "    if (body && body.settings) { base = settingsOf(body.settings); }",
+        "    if (body && body.status) { renderStatus(body.status); }",
+        "    if (body && body.ok) {",
+        "      dirty = false;",
+        "      if (base) { fillForm(base); }",
+        "      show('settings-note', null, false);",
+        "      updateDirty();",
+        "      const applied = Array.isArray(body.applied) ? body.applied : [];",
+        "      settingsResult(applied.length ? 'Applied: ' + applied.map((k) => SETTING_LABELS[k] || k).join(', ') + '.' : 'Nothing to change.', true);",
+        // A refusal the server named is a refusal: it rejected the request before changing
+        // anything. Anything else — a 5xx, a body that is not the answer to this question — is
+        // not evidence that nothing happened, and saying so would be a guess dressed as a fact.
+        "    } else if (body && body.message && r.status < 500) {",
+        "      settingsResult('Not applied \\u2014 ' + body.message, false);",
+        "    } else {",
+        "      setUnknown(true);",
+        "      settingsResult(UNKNOWN + ' (' + r.status + ')', false);",
+        "    }",
+        "  } catch (err) {",
+        // The request left this document. Whether it arrived is exactly what a network error does
+        // not say, so this cannot claim the settings were left alone.
+        "    closeConfirm();",
+        "    setUnknown(true);",
+        "    settingsResult(UNKNOWN + ' (' + err.message + ')', false);",
+        "  } finally {",
+        "    button.disabled = false;",
+        "  }",
         "}",
         // Tag selection and search compose: an entry must pass both. Selection is a set rather
         // than a single value so several severities can be watched at once, which is the whole
@@ -307,7 +525,12 @@ function clientScript(basePath) {
         "  try {",
         "    const r = await fetch(BASE + 'state', { cache: 'no-store' });",
         "    if (!r.ok) { throw new Error('Status request failed (' + r.status + ')'); }",
+        // A successful read is the only thing that can resolve an unknown outcome: it is the
+        // advisor's actual state, which is exactly what the failed request left in doubt.
+        "    const recovered = unknown;",
+        "    if (recovered) { dirty = false; closeConfirm(); base = null; setUnknown(false); }",
         "    applySnapshot(await r.json());",
+        "    if (recovered) { show('settings-note', null, false); settingsResult('Reloaded \\u2014 these are the advisor\\u0027s current settings.', true); }",
         "    setConn('Live updates connected', true);",
         "    show('error', null, true);",
         "  } catch (err) {",
@@ -340,6 +563,17 @@ function clientScript(basePath) {
         "});",
         "el('search').addEventListener('input', renderEntries);",
         "el('refresh').addEventListener('click', load);",
+        "el('settings').addEventListener('submit', reviewSettings);",
+        "el('settings-reset').addEventListener('click', resetSettings);",
+        "el('settings-apply').addEventListener('click', applySettings);",
+        // Cancel closes the confirmation and sends nothing. The edits stay in the form, because
+        // cancelling an apply is not the same as discarding what was typed.
+        "el('settings-cancel').addEventListener('click', () => { closeConfirm(); if (!unknown) { settingsResult('Not applied \\u2014 cancelled.', false); } });",
+        "for (const id of ['set-enabled', 'set-model', 'set-cadence']) {",
+        "  const onEdit = () => { if (unknown) { return; } dirty = !sameSettings(base, readForm()); closeConfirm(); updateDirty(); };",
+        "  el(id).addEventListener('input', onEdit);",
+        "  el(id).addEventListener('change', onEdit);",
+        "}",
         "window.addEventListener('pagehide', () => { if (source) { source.close(); } }, { once: true });",
         "load(); connect();",
     ].join("\n");
@@ -382,6 +616,16 @@ const STYLES = [
     ".check input{width:auto;min-width:0;padding:0;border:0;border-radius:0;accent-color:var(--color-focus-outline,#0969da)}",
     ".search{flex:1 1 180px;min-width:0}",
     "input[type='search']{width:100%;min-width:80px}",
+    // The settings form reuses the reference panel's field rhythm: a narrow column so a text
+    // input never stretches the width of a desktop window, and rows that stack on a phone.
+    ".settings{display:grid;gap:12px;max-width:420px;margin-bottom:12px}",
+    ".field{flex-direction:column;align-items:stretch;gap:4px}",
+    ".field input{width:100%}",
+    ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}",
+    ".confirm{border:1px solid var(--border-color-default,#d0d7de);border-radius:8px;padding:12px;max-width:420px;display:grid;gap:8px}",
+    ".confirm p{margin:0}",
+    ".confirm ul{margin:0;padding-left:18px;font-size:12px}",
+    "#settings-result{margin-top:12px}",
     "input,button{font:inherit;color:inherit;background:var(--background-color-default,#fff);",
     "border:1px solid var(--border-color-default,#d0d7de);border-radius:6px;padding:7px 10px}",
     "button{cursor:pointer}",
@@ -453,6 +697,29 @@ export function renderPanelHtml({ basePath, title = "Advisor activity", nonce = 
     <p id="pending"></p>
     <p id="last-error" class="error" hidden></p>
   </section>
+  <section aria-labelledby="settings-title">
+    <h2 id="settings-title">Session settings</h2>
+    <p class="muted">These apply to this session only. Your configuration file is not changed, and a review already running is not cancelled.</p>
+    <form id="settings" class="settings">
+      <label class="check"><input id="set-enabled" type="checkbox" /> Advisor enabled</label>
+      <label class="field">Model<input id="set-model" type="text" autocomplete="off" spellcheck="false" /></label>
+      <label class="field">Review every N tool calls<input id="set-cadence" type="number" min="1" step="1" /></label>
+      <p id="settings-note" class="muted" role="status" aria-live="polite" hidden></p>
+      <div id="settings-actions" class="row" hidden>
+        <button id="settings-review" type="submit">Review change</button>
+        <button id="settings-reset" type="button">Reset</button>
+      </div>
+    </form>
+    <div id="settings-confirm" class="confirm" hidden>
+      <p><strong>Apply this change?</strong></p>
+      <ul id="settings-diff"></ul>
+      <div class="row">
+        <button id="settings-apply" type="button">Apply change</button>
+        <button id="settings-cancel" type="button">Cancel</button>
+      </div>
+    </div>
+    <p id="settings-result" class="muted" role="status" aria-live="polite" hidden></p>
+  </section>
   <section aria-labelledby="activity-title">
     <div class="activity-heading"><h2 id="activity-title">Recent activity</h2><span id="count" class="muted"></span></div>
     <div class="filters">
@@ -466,7 +733,7 @@ export function renderPanelHtml({ basePath, title = "Advisor activity", nonce = 
     <ol id="entries" aria-label="Advisor activity, newest first"></ol>
   </section>
   <footer>
-    <p>This panel is read-only. Ask the agent for advisor status, the advice log, or a review. Changing the advisor still requires the existing confirmation dialog.</p>
+    <p>Activity above is read-only. The settings here change only this session; anything else \u2014 a review, a config reload \u2014 still goes through the agent and its confirmation dialog.</p>
     <p id="session" class="muted"></p>
   </footer>
 </main>
@@ -499,6 +766,7 @@ export async function createPanelServer({
     getStatus,
     subscribe,
     title,
+    applySettings = null,
     statusIntervalMs = 2000,
     onError = () => {},
 }) {
@@ -512,9 +780,7 @@ export async function createPanelServer({
     let host = "";
 
     const server = createServer((req, res) => {
-        try {
-            handle(req, res);
-        } catch (err) {
+        const fail = (err) => {
             onError(err);
             try {
                 res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
@@ -522,6 +788,14 @@ export async function createPanelServer({
             } catch {
                 // The response is already gone; nothing left to do but not throw.
             }
+        };
+        try {
+            // The settings route is async, so a rejection here would otherwise escape as an
+            // unhandled rejection rather than a 500.
+            const pending = handle(req, res);
+            if (pending && typeof pending.then === "function") pending.catch(fail);
+        } catch (err) {
+            fail(err);
         }
     });
 
@@ -548,14 +822,24 @@ export async function createPanelServer({
     }
 
     function handle(req, res) {
-        if (req.method !== "GET") return deny(res, 405);
         if (req.headers.host !== host) return deny(res, 403);
         if (req.headers.origin && req.headers.origin !== origin) return deny(res, 403);
 
         const parts = new URL(req.url, origin).pathname.split("/").filter(Boolean);
         if (parts.length === 0 || !tokenMatches(parts[0])) return deny(res, 404);
 
-        switch (parts[1] ?? "") {
+        const route = parts[1] ?? "";
+        // The one write. It exists only when the extension handed this server something to write
+        // to; a panel with no `applySettings` has no such route at all rather than a route that
+        // refuses, so a read-only panel cannot be probed for one.
+        if (route === "settings" && applySettings) {
+            if (req.method !== "POST") return deny(res, 405);
+            return receiveSettings(req, res);
+        }
+
+        if (req.method !== "GET") return deny(res, 405);
+
+        switch (route) {
             case "":
                 return sendHtml(res);
             case "state":
@@ -565,6 +849,78 @@ export async function createPanelServer({
             default:
                 return deny(res, 404);
         }
+    }
+
+    function sendJson(res, code, payload) {
+        res.writeHead(code, securityHeaders({ "Content-Type": "application/json; charset=utf-8" }));
+        res.end(JSON.stringify(payload));
+    }
+
+    // Buffers at most `MAX_SETTINGS_BODY_BYTES`. A settings write is three small values, so a body
+    // that needs more than 4KiB is not one, and reading it to find out is the only thing worth
+    // refusing here.
+    function readBody(req) {
+        return new Promise((resolve, reject) => {
+            const declared = Number(req.headers["content-length"]);
+            if (Number.isFinite(declared) && declared > MAX_SETTINGS_BODY_BYTES) {
+                const err = new Error("body too large");
+                err.code = "too-large";
+                reject(err);
+                return;
+            }
+            let size = 0;
+            const chunks = [];
+            req.on("data", (chunk) => {
+                size += chunk.length;
+                if (size > MAX_SETTINGS_BODY_BYTES) {
+                    const err = new Error("body too large");
+                    err.code = "too-large";
+                    reject(err);
+                    return;
+                }
+                chunks.push(chunk);
+            });
+            req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+            req.on("error", reject);
+        });
+    }
+
+    async function receiveSettings(req, res) {
+        // A read may arrive without an `Origin` — a same-origin GET and the host's own iframe
+        // navigation both do. A write may not: the absence that is unremarkable on a read is the
+        // signature of a request that did not come from this document, and this is the request
+        // that changes something.
+        if (req.headers.origin !== origin) return deny(res, 403);
+        const type = String(req.headers["content-type"] ?? "")
+            .split(";")[0]
+            .trim()
+            .toLowerCase();
+        if (type !== "application/json") return deny(res, 415);
+
+        let text;
+        try {
+            text = await readBody(req);
+        } catch (err) {
+            if (err?.code === "too-large") {
+                deny(res, 413);
+                req.destroy();
+                return;
+            }
+            return deny(res, 400);
+        }
+
+        const parsed = parseSettingsRequest(text);
+        if (parsed.error) return sendJson(res, 400, { ok: false, code: "invalid", message: parsed.error });
+
+        let result;
+        try {
+            result = await applySettings(parsed.request);
+        } catch (err) {
+            onError(err);
+            return sendJson(res, 500, { ok: false, code: "failed", message: "the change could not be applied" });
+        }
+        if (result?.ok) return sendJson(res, 200, result);
+        return sendJson(res, result?.code === "stale" ? 409 : 400, result ?? { ok: false, code: "failed" });
     }
 
     function sendHtml(res) {

@@ -19,6 +19,7 @@ import {
     escapeHtml,
     mergeDurableHistory,
     parseAdviceLog,
+    parseSettingsRequest,
     renderPanelHtml,
     truncateToBytes,
 } from "./panel.mjs";
@@ -596,4 +597,229 @@ test("reopening is the caller's job: two servers get two ports", async () => {
             assert.notEqual(first.port, second.port);
         });
     });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Settings: the one write the panel has.
+
+function postJson(port, path, { body = "", headers = {}, host = null } = {}) {
+    return new Promise((resolve, reject) => {
+        const socket = connect(port, "127.0.0.1", () => {
+            const payload = Buffer.from(body, "utf8");
+            const lines = [`POST ${path} HTTP/1.1`, `Host: ${host ?? `127.0.0.1:${port}`}`];
+            const sent = { "Content-Type": "application/json", ...headers };
+            for (const [k, v] of Object.entries(sent)) {
+                if (v !== null) lines.push(`${k}: ${v}`);
+            }
+            lines.push(`Content-Length: ${payload.length}`);
+            socket.write(`${lines.join("\r\n")}\r\nConnection: close\r\n\r\n`);
+            socket.write(payload);
+        });
+        let raw = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => (raw += chunk));
+        socket.on("error", reject);
+        socket.on("close", () => {
+            const status = Number.parseInt(raw.slice(9, 12), 10);
+            const split = raw.indexOf("\r\n\r\n");
+            const head = raw.slice(0, split);
+            const text = split === -1 ? "" : raw.slice(split + 4);
+            const decoded = /transfer-encoding:\s*chunked/i.test(head) ? dechunk(text) : text;
+            let parsed = null;
+            try {
+                parsed = JSON.parse(decoded);
+            } catch {
+                parsed = null;
+            }
+            resolve({ status, headers: head, body: decoded, json: parsed });
+        });
+    });
+}
+
+const BASELINE = { enabled: true, model: "gpt-5-mini", everyNToolCalls: 6 };
+
+/** A server with a settings route, recording every call that reaches the apply callback. */
+async function withSettings(run, reply = (req) => ({ ok: true, applied: [], settings: req.desired })) {
+    const calls = [];
+    await withServer(
+        async ({ panel }) => {
+            const send = (body, opts) =>
+                postJson(panel.port, `${panel.basePath}settings`, {
+                    body: typeof body === "string" ? body : JSON.stringify(body),
+                    headers: { Origin: `http://127.0.0.1:${panel.port}`, ...(opts?.headers ?? {}) },
+                    host: opts?.host ?? null,
+                });
+            await run({ panel, calls, send });
+        },
+        {
+            applySettings: (req) => {
+                calls.push(req);
+                return reply(req);
+            },
+        },
+    );
+}
+
+test("a valid settings write reaches the apply callback exactly once", async () => {
+    await withSettings(async ({ calls, send }) => {
+        const res = await send({ expected: BASELINE, desired: { ...BASELINE, everyNToolCalls: 9 } });
+        assert.equal(res.status, 200);
+        assert.equal(res.json.ok, true);
+        assert.equal(calls.length, 1);
+        assert.deepEqual(calls[0].expected, BASELINE);
+        assert.equal(calls[0].desired.everyNToolCalls, 9);
+    });
+});
+
+test("the settings response carries no CORS grant", async () => {
+    await withSettings(async ({ send }) => {
+        const res = await send({ expected: BASELINE, desired: BASELINE });
+        assert.ok(!/access-control-allow/i.test(res.headers), "a browser must not be able to read this cross-origin");
+        assert.ok(/Cache-Control: no-store/i.test(res.headers));
+    });
+});
+
+test("a settings write without an Origin is refused", async () => {
+    // A same-origin GET legitimately sends none. A write may not: browsers attach Origin to every
+    // POST, so its absence means the request did not come from this document.
+    await withSettings(async ({ panel, calls }) => {
+        const res = await postJson(panel.port, `${panel.basePath}settings`, {
+            body: JSON.stringify({ expected: BASELINE, desired: BASELINE }),
+        });
+        assert.equal(res.status, 403);
+        assert.equal(calls.length, 0);
+    });
+});
+
+test("a settings write from a foreign Origin is refused", async () => {
+    await withSettings(async ({ calls, send }) => {
+        const res = await send(
+            { expected: BASELINE, desired: BASELINE },
+            { headers: { Origin: "http://attacker.example" } },
+        );
+        assert.equal(res.status, 403);
+        assert.equal(calls.length, 0);
+    });
+});
+
+test("a settings write with a rebound Host is refused", async () => {
+    await withSettings(async ({ calls, send }) => {
+        const res = await send({ expected: BASELINE, desired: BASELINE }, { host: "attacker.example" });
+        assert.equal(res.status, 403);
+        assert.equal(calls.length, 0);
+    });
+});
+
+test("a settings write at a wrong token is a 404, not a 403", async () => {
+    await withSettings(async ({ panel, calls }) => {
+        const res = await postJson(panel.port, "/0000000000000000000000000000000000000000000000/settings", {
+            body: JSON.stringify({ expected: BASELINE, desired: BASELINE }),
+            headers: { Origin: `http://127.0.0.1:${panel.port}` },
+        });
+        assert.equal(res.status, 404);
+        assert.equal(calls.length, 0);
+    });
+});
+
+test("a GET on the settings route is refused", async () => {
+    await withSettings(async ({ panel, calls }) => {
+        assert.equal((await request(panel.port, `${panel.basePath}settings`)).status, 405);
+        assert.equal(calls.length, 0);
+    });
+});
+
+test("a panel with no apply callback has no settings route at all", async () => {
+    await withServer(async ({ panel }) => {
+        const res = await postJson(panel.port, `${panel.basePath}settings`, {
+            body: JSON.stringify({ expected: BASELINE, desired: BASELINE }),
+            headers: { Origin: `http://127.0.0.1:${panel.port}` },
+        });
+        // The same 405 any non-GET gets anywhere on a read-only panel: the route is not declined,
+        // it does not exist, and nothing about the answer says which.
+        assert.equal(res.status, 405, "a read-only panel must not accept a write");
+    });
+});
+
+test("a settings write that is not JSON is refused", async () => {
+    await withSettings(async ({ calls, send }) => {
+        const res = await send({ expected: BASELINE, desired: BASELINE }, { headers: { "Content-Type": "text/plain" } });
+        assert.equal(res.status, 415);
+        assert.equal(calls.length, 0);
+    });
+});
+
+test("an oversized settings body is refused before it is parsed", async () => {
+    await withSettings(async ({ calls, send }) => {
+        const res = await send(JSON.stringify({ expected: BASELINE, desired: BASELINE, pad: "x".repeat(9000) }));
+        assert.equal(res.status, 413);
+        assert.equal(calls.length, 0);
+    });
+});
+
+test("a stale baseline is a 409 and the callback decides it, not the transport", async () => {
+    await withSettings(
+        async ({ calls, send }) => {
+            const res = await send({ expected: BASELINE, desired: { ...BASELINE, enabled: false } });
+            assert.equal(res.status, 409);
+            assert.equal(res.json.ok, false);
+            assert.equal(res.json.code, "stale");
+            assert.equal(calls.length, 1, "staleness is semantic, so it is the extension's call to make");
+        },
+        () => ({ ok: false, code: "stale", message: "moved", settings: BASELINE }),
+    );
+});
+
+test("an apply callback that throws is a 500, not a silent success", async () => {
+    await withSettings(
+        async ({ send }) => {
+            const res = await send({ expected: BASELINE, desired: { ...BASELINE, enabled: false } });
+            assert.equal(res.status, 500);
+            assert.equal(res.json.ok, false);
+        },
+        () => {
+            throw new Error("boom");
+        },
+    );
+});
+test("parseSettingsRequest accepts exactly the three settings and trims the model", () => {
+    const { request, error } = parseSettingsRequest(
+        JSON.stringify({
+            expected: { enabled: true, model: " gpt-5-mini ", everyNToolCalls: 6 },
+            desired: { enabled: false, model: "claude-sonnet-5", everyNToolCalls: 1 },
+        }),
+    );
+    assert.equal(error, undefined);
+    assert.deepEqual(request.expected, { enabled: true, model: "gpt-5-mini", everyNToolCalls: 6 });
+    assert.deepEqual(request.desired, { enabled: false, model: "claude-sonnet-5", everyNToolCalls: 1 });
+});
+
+test("parseSettingsRequest rejects what it cannot act on", () => {
+    const bad = (body) => parseSettingsRequest(typeof body === "string" ? body : JSON.stringify(body)).error;
+    const both = (over) => ({ expected: BASELINE, desired: { ...BASELINE, ...over } });
+
+    assert.match(bad("not json"), /valid JSON/);
+    assert.match(bad("[]"), /JSON object/);
+    assert.match(bad("null"), /JSON object/);
+    assert.match(bad({ desired: BASELINE }), /expected is missing/);
+    assert.match(bad({ expected: BASELINE }), /desired is missing/);
+    // A field this endpoint does not implement is a caller that thinks it is doing something.
+    assert.match(bad({ expected: BASELINE, desired: BASELINE, blockOnBlocker: false }), /not a field/);
+    assert.match(bad({ expected: BASELINE, desired: { ...BASELINE, agentType: "x" } }), /not a setting/);
+    assert.match(bad({ expected: BASELINE, desired: { enabled: true, model: "m" } }), /everyNToolCalls is missing/);
+    assert.match(bad(both({ enabled: "yes" })), /true or false/);
+    assert.match(bad(both({ model: 7 })), /must be a string/);
+    assert.match(bad(both({ model: "   " })), /must not be empty/);
+    assert.match(bad(both({ model: "x".repeat(201) })), /longer than/);
+    assert.match(bad(both({ model: "gpt\u0000mini" })), /control character/);
+    assert.match(bad(both({ everyNToolCalls: 2.5 })), /whole number/);
+    assert.match(bad(both({ everyNToolCalls: "6" })), /whole number/);
+    assert.match(bad(both({ everyNToolCalls: 0 })), /between 1 and/);
+    assert.match(bad(both({ everyNToolCalls: -1 })), /between 1 and/);
+    assert.match(bad(both({ everyNToolCalls: 100000 })), /between 1 and/);
+});
+
+test("parseSettingsRequest requires a baseline rather than defaulting one", () => {
+    // Without it, a confirmation the user read minutes ago can be applied against values that
+    // have since moved, and the change that happens is not the change they approved.
+    assert.match(parseSettingsRequest(JSON.stringify({ expected: null, desired: BASELINE })).error, /expected must be/);
 });

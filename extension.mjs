@@ -33,6 +33,7 @@ import {
 import {
     ACTIVITY_LIMIT,
     ADVICE_TAGS,
+    SETTINGS_KEYS,
     createActivityLog,
     createPanelServer,
     mergeDurableHistory,
@@ -1101,40 +1102,91 @@ function formatAdviceLog(result) {
 // Every control operation is recorded. The tool is reachable by the agent being reviewed, so
 // "the advisor went quiet" must always have a visible cause rather than being something that can
 // happen silently.
-function noteControl(title, detail) {
-    activity.push({ tag: "control", title, detail });
-    debug(`control: ${title}${detail ? ` — ${detail}` : ""}`);
+//
+// The source is recorded too, because the three ways in do not carry the same authority. A slash
+// command is the user typing; the panel is the user's own hands on the controls, confirmed in the
+// panel's document; the tool is the *model* asking, and the model is the thing being reviewed. An
+// audit trail that cannot tell those apart cannot answer the question it exists for.
+const CONTROL_SOURCES = {
+    command: "a slash command",
+    tool: "the advisor_control tool",
+    panel: "the activity panel",
+};
+
+function noteControl(title, detail, source = "command") {
+    const via = CONTROL_SOURCES[source] ? source : "command";
+    const suffix = `via ${CONTROL_SOURCES[via]}`;
+    activity.push({ tag: "control", title, detail: detail ? `${detail} — ${suffix}` : suffix, source: via });
+    debug(`control (${via}): ${title}${detail ? ` — ${detail}` : ""}`);
 }
 
-function controlSetEnabled(enabled) {
+function controlSetEnabled(enabled, source) {
     state.sessionOverrides.enabled = enabled;
     if (enabled) state.lastReportedError = null;
     else state.pendingAdvice = null;
-    noteControl(enabled ? "advisor enabled" : "advisor disabled", enabled ? "" : "pending advice discarded");
+    noteControl(enabled ? "advisor enabled" : "advisor disabled", enabled ? "" : "pending advice discarded", source);
     return { enabled };
 }
 
-function controlSetModel(model) {
+function controlSetModel(model, source) {
     if (!model) return { model: cfg("model"), changed: false };
     state.sessionOverrides.model = model;
-    noteControl("model changed", model);
+    noteControl("model changed", model, source);
     return { model, changed: true };
 }
 
-function controlSetCadence(everyNToolCalls) {
+function controlSetCadence(everyNToolCalls, source) {
     if (!Number.isFinite(everyNToolCalls) || everyNToolCalls < 1) {
         return { everyNToolCalls: cfg("everyNToolCalls"), changed: false };
     }
     state.sessionOverrides.everyNToolCalls = everyNToolCalls;
-    noteControl("cadence changed", `every ${everyNToolCalls} tool calls`);
+    noteControl("cadence changed", `every ${everyNToolCalls} tool calls`, source);
     return { everyNToolCalls, changed: true };
 }
 
-function controlReloadConfig() {
+function controlReloadConfig(source) {
     config = loadConfig(process.cwd());
     state.sessionOverrides = {};
-    noteControl("config reloaded", config._configPath ?? "built-in defaults");
+    noteControl("config reloaded", config._configPath ?? "built-in defaults", source);
     return { configPath: config._configPath ?? null };
+}
+
+function currentSettings() {
+    return { enabled: cfg("enabled"), model: cfg("model"), everyNToolCalls: cfg("everyNToolCalls") };
+}
+
+// The panel's write path. It does not go through `confirmChange`, and that is the point of the
+// distinction above: the tool's confirmation exists because the model asked for the change, and
+// the panel is not the model. The user has already been shown the exact change in the panel's own
+// document and pressed Apply there — asking a second time through a host dialog would be asking
+// the same person the same question, and doing it from an idle HTTP callback is the thing that
+// wedges the app.
+//
+// Values arrive already validated for shape and range by `parseSettingsRequest`, so everything
+// here is about whether the change still makes sense: the baseline the user confirmed against
+// must still be current, and either all three settings move or none do.
+function applyPanelSettings({ expected, desired }) {
+    const current = currentSettings();
+    const drifted = SETTINGS_KEYS.filter((key) => expected[key] !== current[key]);
+    if (drifted.length > 0) {
+        return {
+            ok: false,
+            code: "stale",
+            message: `the advisor changed while you were reviewing (${drifted.join(", ")}) — check the current values and try again`,
+            settings: current,
+            status: controlStatus(),
+        };
+    }
+
+    const applied = SETTINGS_KEYS.filter((key) => desired[key] !== current[key]);
+    // Nothing below can fail, so there is no state in which one of the three has moved and the
+    // others have not.
+    if (applied.includes("model")) controlSetModel(desired.model, "panel");
+    if (applied.includes("everyNToolCalls")) controlSetCadence(desired.everyNToolCalls, "panel");
+    // Last, so that disabling discards advice the other two could not have produced in between.
+    if (applied.includes("enabled")) controlSetEnabled(desired.enabled, "panel");
+
+    return { ok: true, applied, settings: currentSettings(), status: controlStatus() };
 }
 
 // Re-reads the session's advice log on every explicit refresh rather than caching it: a cached
@@ -1224,7 +1276,7 @@ function notApplied(operation, reason) {
         reason === "unavailable"
             ? "this host cannot show a confirmation dialog"
             : "the user declined";
-    noteControl(`${operation} not applied`, why);
+    noteControl(`${operation} not applied`, why, "tool");
     return `advisor: ${operation} was NOT applied — ${why}.`;
 }
 
@@ -1296,7 +1348,7 @@ const advisorControlTool = {
             case "enable": {
                 const { confirmed, reason } = await confirmChange("Enable the advisor for this session?");
                 if (!confirmed) return notApplied("enable", reason);
-                controlSetEnabled(true);
+                controlSetEnabled(true, "tool");
                 return "advisor: enabled";
             }
             case "disable": {
@@ -1304,7 +1356,7 @@ const advisorControlTool = {
                     "Disable the advisor for this session? It will stop reviewing this agent's work until re-enabled.",
                 );
                 if (!confirmed) return notApplied("disable", reason);
-                controlSetEnabled(false);
+                controlSetEnabled(false, "tool");
                 return "advisor: disabled for this session. Re-enable with advisor_control operation=enable.";
             }
             case "set_model": {
@@ -1314,7 +1366,7 @@ const advisorControlTool = {
                     `Change the advisor's review model from ${cfg("model")} to ${requested}?`,
                 );
                 if (!confirmed) return notApplied("set_model", reason);
-                return `advisor model set to ${controlSetModel(requested).model}`;
+                return `advisor model set to ${controlSetModel(requested, "tool").model}`;
             }
             case "set_cadence": {
                 const requested = args?.everyNToolCalls;
@@ -1325,14 +1377,14 @@ const advisorControlTool = {
                     `Change the advisor's review cadence from every ${cfg("everyNToolCalls")} tool calls to every ${requested}?`,
                 );
                 if (!confirmed) return notApplied("set_cadence", reason);
-                return `advisor will review every ${controlSetCadence(requested).everyNToolCalls} tool calls`;
+                return `advisor will review every ${controlSetCadence(requested, "tool").everyNToolCalls} tool calls`;
             }
             default: {
                 const { confirmed, reason } = await confirmChange(
                     "Reload advisor config from disk? This discards any per-session advisor settings.",
                 );
                 if (!confirmed) return notApplied("reload_config", reason);
-                return `advisor config reloaded from ${controlReloadConfig().configPath ?? "built-in defaults"}`;
+                return `advisor config reloaded from ${controlReloadConfig("tool").configPath ?? "built-in defaults"}`;
             }
         }
     },
@@ -1366,6 +1418,7 @@ const activityCanvas = createCanvas({
                 getSnapshot: panelSnapshot,
                 getStatus: controlStatus,
                 subscribe: activity.subscribe,
+                applySettings: applyPanelSettings,
                 onError: (err) => debug(`panel server error: ${err?.message ?? err}`),
             });
             panels.set(ctx.instanceId, panel);
@@ -1588,7 +1641,7 @@ const session = await joinSession({
             name: "advisor-reload",
             description: "Reload advisor.json config from disk",
             handler: async () => {
-                await report(`advisor config reloaded from ${controlReloadConfig().configPath ?? "built-in defaults"}`);
+                await report(`advisor config reloaded from ${controlReloadConfig("tool").configPath ?? "built-in defaults"}`);
             },
         },
     ],
