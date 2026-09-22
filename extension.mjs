@@ -36,6 +36,7 @@ import {
     SETTINGS_KEYS,
     createActivityLog,
     createPanelServer,
+    describeAdviceEntry,
     mergeDurableHistory,
     parseAdviceLog,
 } from "./panel.mjs";
@@ -215,7 +216,11 @@ function recordAdvice(severity, note, outcome) {
     const path = sessionScopedPath(cfg("adviceLog"));
     let logged = false;
     if (path) {
-        const stamp = new Date().toLocaleTimeString();
+        // An instant, not a clock time. The log is durable and is read days later, where
+        // `11:00:02` is indistinguishable from "just now" — that misreading is what this format
+        // exists to prevent. ISO is stored because it is unambiguous and sorts; the panel and
+        // `/advisor-log` render it into the reader's own local date and time.
+        const stamp = new Date().toISOString();
         const entry = `${ADVICE_ENTRY_SEPARATOR}\n### [${stamp}] ${severity.toUpperCase()} (${outcome})\n${note}\n`;
         try {
             appendFileSync(path, entry);
@@ -1095,7 +1100,10 @@ function formatAdviceLog(result) {
     if (result.total === 0) return `advisor: no advice recorded yet this session\n${result.path}`;
     return (
         `advisor — last ${result.entries.length} of ${result.total} advice entries\n${result.path}\n\n` +
-        result.entries.join("\n\n")
+        // Headers are rendered, not replayed: a stored instant becomes the reader's local date
+        // and time, and an entry from before the advisor recorded dates says so. The file on
+        // disk is unchanged either way.
+        result.entries.map(describeAdviceEntry).join("\n\n")
     );
 }
 

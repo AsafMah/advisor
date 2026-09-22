@@ -13,13 +13,19 @@ import {
     ACTIVITY_LIMIT,
     MAX_DETAIL_BYTES,
     MAX_PAYLOAD_BYTES,
+    STAMP_FORMAT,
+    STAMP_UNKNOWN_DATE,
     boundBySerializedBytes,
     createActivityLog,
     createPanelServer,
+    describeAdviceEntry,
+    describeStamp,
     escapeHtml,
+    formatStamp,
     mergeDurableHistory,
     parseAdviceLog,
     parseSettingsRequest,
+    readStamp,
     renderPanelHtml,
     truncateToBytes,
 } from "./panel.mjs";
@@ -201,6 +207,103 @@ test("parseAdviceLog bounds an oversized entry from disk", () => {
 test("parseAdviceLog marks an unknown severity as a plain review", () => {
     const [entry] = parseAdviceLog("### [12:00:01] whatever (raised)\nbody", SEPARATOR);
     assert.equal(entry.tag, "review");
+});
+
+// --- timestamps -----------------------------------------------------------------------------
+//
+// An advice row reading `11:00:02` was read as current when it was eight days old. Every test
+// here defends one half of the fix: a dated entry says which day, and an undated one says it
+// cannot — without either of them ever standing in for the other.
+
+const ISO = "2026-09-14T08:00:02.975Z";
+
+test("readStamp reads an ISO header as an instant", () => {
+    assert.deepEqual(readStamp(ISO), { at: ISO, time: ISO });
+    // Offsets are normalised to the same instant, so an entry written in another zone sorts and
+    // renders with the rest.
+    assert.equal(readStamp("2026-09-14T11:00:02+03:00").at, "2026-09-14T08:00:02.000Z");
+});
+
+test("readStamp never invents a date for a header that has none", () => {
+    // The whole point: `Date.parse` resolves several time-only forms against *today*, which is
+    // precisely the misreading this change exists to stop.
+    for (const legacy of ["11:00:02", "11:00:02 AM", "12:00:01", "9/14/2026, 11:00:02 AM", ""]) {
+        assert.equal(readStamp(legacy).at, null, `${JSON.stringify(legacy)} must not become an instant`);
+    }
+    assert.equal(readStamp("11:00:02").time, "11:00:02", "the recorded text is kept as it was");
+});
+
+test("parseAdviceLog carries a dated header through as an instant", () => {
+    const [entry] = parseAdviceLog(`### [${ISO}] BLOCKER (raised)\nDo not ship this.`, SEPARATOR);
+    assert.equal(entry.at, ISO);
+    assert.equal(entry.tag, "blocker");
+    assert.equal(entry.detail, "Do not ship this.");
+});
+
+test("parseAdviceLog reads a file holding both eras without confusing them", () => {
+    const text = [
+        "### [11:00:02] BLOCKER (DENIED tool call: send_session_message)\nold and undated",
+        `### [${ISO}] concern (injected)\nnew and dated`,
+    ].join(SEPARATOR);
+
+    const [old_, fresh] = parseAdviceLog(text, SEPARATOR);
+    assert.equal(old_.at, null);
+    assert.equal(old_.time, "11:00:02");
+    assert.equal(fresh.at, ISO);
+});
+
+test("formatStamp renders a full local date and time, and nothing for a non-instant", () => {
+    const shown = formatStamp(ISO);
+    assert.equal(shown, new Date(ISO).toLocaleString(undefined, STAMP_FORMAT));
+    // The date is the point. Whatever the host locale, the year has to be in there.
+    assert.match(shown, new RegExp(String(new Date(ISO).getFullYear())));
+    assert.equal(formatStamp(null), "");
+    assert.equal(formatStamp("11:00:02"), "");
+});
+
+test("describeStamp labels an undated entry instead of dating it", () => {
+    assert.equal(describeStamp({ at: null, time: "11:00:02" }), `11:00:02 \u2014 ${STAMP_UNKNOWN_DATE}`);
+    assert.equal(describeStamp({ at: ISO, time: ISO }), formatStamp(ISO));
+    assert.equal(describeStamp({ at: null, time: "" }), "", "an entry with no stamp at all claims nothing");
+    assert.equal(describeStamp(undefined), "");
+    const today = new Date().toLocaleDateString();
+    assert.ok(!describeStamp({ at: null, time: "11:00:02" }).includes(today), "today's date must not leak in");
+});
+
+test("describeAdviceEntry dates a stored instant and keeps the rest of the entry intact", () => {
+    const out = describeAdviceEntry(`### [${ISO}] BLOCKER (raised)\nline one\nline two`);
+    assert.equal(out, `### [${formatStamp(ISO)}] BLOCKER (raised)\nline one\nline two`);
+});
+
+test("describeAdviceEntry says so when the entry predates dated logging", () => {
+    const out = describeAdviceEntry("### [11:00:02] BLOCKER (DENIED tool call: send_session_message)\nbody");
+    assert.equal(
+        out,
+        `### [11:00:02 \u2014 ${STAMP_UNKNOWN_DATE}] BLOCKER (DENIED tool call: send_session_message)\nbody`,
+    );
+});
+
+test("describeAdviceEntry passes an unparseable entry through untouched", () => {
+    assert.equal(describeAdviceEntry("something entirely unexpected"), "something entirely unexpected");
+    assert.equal(describeAdviceEntry(""), "");
+});
+
+test("describeAdviceEntry separates entries from different days", () => {
+    // Half a minute either side of the host's own local midnight. A time-only render shows
+    // 23:59:30 and 00:00:30 and hides that they are different days; this is the case that has to
+    // read unambiguously, and computing it from the local zone keeps it true wherever it runs.
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    const stamp = (offsetMs) => new Date(midnight.getTime() + offsetMs).toISOString();
+    const head = (text) => text.slice(0, text.indexOf("]"));
+
+    const before = describeAdviceEntry(`### [${stamp(-30000)}] concern (raised)\na`);
+    const after = describeAdviceEntry(`### [${stamp(30000)}] concern (raised)\nb`);
+    assert.notEqual(
+        head(before),
+        head(after),
+        "a minute either side of local midnight has to render as two different days",
+    );
 });
 
 // --- durable history merge ------------------------------------------------------------------

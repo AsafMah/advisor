@@ -5,6 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
 
 import { bootExtension } from "./harness/host.mjs";
 
@@ -408,6 +409,45 @@ test("the refresh action on an unknown instance says so instead of throwing", as
     const result = await host.canvasAction("refresh", "never-opened");
     assert.equal(result.refreshed, false);
     assert.match(result.reason, /no open advisor panel/);
+});
+
+// --- advice log timestamps ---------------------------------------------------------------------
+
+test("a new advice entry is written with a date, and reads back with one", async () => {
+    // An advice row reading `11:00:02` was taken for current when it was eight days old. The log
+    // is the durable half of that: whatever it stores is what a reader sees days later, so it has
+    // to store an instant rather than a clock time.
+    const host = await bootExtension({ config: { adviceLog: "advice.log", minSeverityToInject: "nit" } });
+    await host.runCheck({ severity: "concern", note: "a dated concern" });
+
+    const output = await host.callTool("advisor_control", { operation: "log" });
+    assert.match(output, /a dated concern/, `the entry never reached the log: ${output}`);
+
+    const path = output.split("\n")[1].trim();
+    const raw = readFileSync(path, "utf8");
+    assert.match(raw, /### \[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, `header is not an instant: ${raw}`);
+
+    const year = String(new Date().getFullYear());
+    assert.ok(output.includes(year), `rendered header carries no date: ${output}`);
+    assert.ok(!output.includes("date unavailable"), "a dated entry must not be labelled undated");
+});
+
+test("an entry written before the advisor recorded dates says its date is missing", async () => {
+    // Real files hold both eras. The old entries are history and are not rewritten, backfilled or
+    // dropped — the rendering is where the missing date gets admitted.
+    const host = await bootExtension({ config: { adviceLog: "advice.log", minSeverityToInject: "nit" } });
+    await host.runCheck({ severity: "concern", note: "a dated concern" });
+
+    const path = (await host.callTool("advisor_control", { operation: "log" })).split("\n")[1].trim();
+    const legacy = "\u001e\n### [11:00:02] BLOCKER (DENIED tool call: send_session_message)\nold and undated\n";
+    writeFileSync(path, readFileSync(path, "utf8") + legacy);
+
+    const output = await host.callTool("advisor_control", { operation: "log" });
+    assert.match(output, /11:00:02 \u2014 date unavailable/, `the old entry was not labelled: ${output}`);
+    assert.match(output, /old and undated/, "the entry's own text must survive untouched");
+    // Both eras in one read, and the new one still dated.
+    assert.ok(output.includes(String(new Date().getFullYear())), "the dated entry lost its date");
+    assert.match(readFileSync(path, "utf8"), /### \[11:00:02\]/, "the file itself must not be rewritten");
 });
 
 // --- activity feed ----------------------------------------------------------------------------

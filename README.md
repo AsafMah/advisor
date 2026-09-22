@@ -231,6 +231,13 @@ Activity is listed newest first and narrowed by two filters that compose: a chec
 several severities can be watched at once, and a free-text search over titles and notes. The layout
 deliberately mirrors the self-learn activity panel so the two read as one product.
 
+Every row carries a full local date and time, not a bare clock time — a row reading `11:00:02` was
+once taken for current when it was eight days old. The advice log stores an ISO instant and the
+panel renders it in the reader's own timezone, so entries either side of midnight read as different
+days. Entries written before the advisor recorded dates are shown as `11:00:02 — date unavailable`:
+their date is genuinely unrecoverable, and today's date or the file's mtime would both be wrong,
+the second more convincingly. The log is never rewritten or backfilled to close that gap.
+
 ### Changing settings from the panel
 
 The panel can change three things for the running session: whether the advisor is enabled, the
@@ -328,7 +335,9 @@ Advice is delivered into the agent's context, where you cannot see it. Two thing
   deliberately does not default to `error`: see
   [Advice is not a session failure](#advice-is-not-a-session-failure).
 - **The advice log.** A human-readable record of every outcome: raised, injected, denied, dropped
-  as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup.
+  as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup. Each
+  entry is stamped with an ISO instant; `/advisor-log` renders that as a local date and time, and
+  labels an older, undated entry rather than guessing a date for it.
 
 Log paths are suffixed with the session id, because otherwise concurrent sessions interleave
 their entries into a single unreadable file.

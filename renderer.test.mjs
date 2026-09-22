@@ -217,6 +217,68 @@ if (!EDGE) {
         });
     });
 
+    test("a dated row shows its date, and an undated one says the date is missing", async () => {
+        // The reported failure: a blocker from eight days earlier rendered as `11:00:02` and was
+        // read as current. Both eras of entry are on screen here at once, so neither can be
+        // mistaken for the other.
+        const iso = "2026-09-14T08:00:02.975Z";
+        await withRenderedPanel(
+            async ({ browser }) => {
+                const metas = await browser.evaluate(
+                    "Array.from(document.querySelectorAll('#entries .entry-meta')).map(e => e.textContent)",
+                );
+                const dated = metas.find((t) => t.includes("dated entry"));
+                const legacy = metas.find((t) => t.includes("legacy entry"));
+
+                const year = String(new Date(iso).getFullYear());
+                assert.ok(dated.includes(year), `the stored instant lost its date: ${JSON.stringify(dated)}`);
+                assert.ok(!dated.includes("date unavailable"), "a dated entry must not be labelled undated");
+
+                assert.ok(legacy.includes("11:00:02"), "the recorded time must survive");
+                assert.ok(
+                    legacy.includes("date unavailable"),
+                    `an undated entry must say so: ${JSON.stringify(legacy)}`,
+                );
+                const today = new Date().toLocaleDateString();
+                assert.ok(!legacy.includes(today), "an undated entry must not borrow today's date");
+            },
+            [
+                { tag: "blocker", title: "legacy entry", detail: "old", at: null, time: "11:00:02" },
+                { tag: "concern", title: "dated entry", detail: "new", at: iso },
+            ],
+        );
+    });
+
+    test("rows either side of local midnight read as different days", async () => {
+        // Time-only labels show 23:59:30 and 00:00:30 and hide the day boundary between them.
+        const midnight = new Date();
+        midnight.setHours(0, 0, 0, 0);
+        const stamp = (offsetMs) => new Date(midnight.getTime() + offsetMs).toISOString();
+        await withRenderedPanel(
+            async ({ browser }) => {
+                const metas = await browser.evaluate(
+                    "Array.from(document.querySelectorAll('#entries .entry-meta')).map(e => e.textContent)",
+                );
+                const when = (title) => {
+                    const row = metas.find((t) => t.includes(title));
+                    return row.slice(row.lastIndexOf("|") + 1).trim();
+                };
+                assert.notEqual(when("before midnight"), when("after midnight"));
+                // Not merely different — different in the date, not just the clock.
+                const dayOf = (text) => text.replace(/\d{1,2}:\d{2}:\d{2}.*$/, "").trim();
+                assert.notEqual(
+                    dayOf(when("before midnight")),
+                    dayOf(when("after midnight")),
+                    "the day has to change, not only the time",
+                );
+            },
+            [
+                { tag: "nit", title: "before midnight", detail: "", at: stamp(-30000) },
+                { tag: "nit", title: "after midnight", detail: "", at: stamp(30000) },
+            ],
+        );
+    });
+
     test("markup in an advice note renders as text, not as markup", async () => {
         await withRenderedPanel(
             async ({ browser }) => {

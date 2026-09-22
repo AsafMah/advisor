@@ -202,6 +202,84 @@ export function createActivityLog(limit = ACTIVITY_LIMIT) {
 
 const ADVICE_HEADER = /^###\s*\[([^\]]*)\]\s+(\S+)\s+\((.*)\)\s*$/;
 
+// Every stamp the panel and the tool render goes through this, so a row can never be read as
+// "just now" when it is days old. That is not hypothetical: an advice row reading `11:00:02` was
+// read as current when it was eight days old, because a bare clock time looks like today.
+//
+// Explicit components rather than `dateStyle`/`timeStyle`, which cannot be combined with
+// `timeZoneName` — the pair throws a TypeError. The zone is worth the width: what is stored is a
+// UTC instant and what is shown is the reader's local time, so the two only agree by accident.
+export const STAMP_FORMAT = {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+};
+
+// Entries the advisor wrote before it recorded dates. Their date is genuinely unrecoverable —
+// today's date and the file's mtime are both wrong answers, and the second is worse for looking
+// plausible — so the display says so rather than inventing one.
+export const STAMP_UNKNOWN_DATE = "date unavailable";
+
+// Deliberately strict. `Date.parse` accepts far more than ISO 8601, and several of the things it
+// accepts are time-only forms it resolves against *today* — which is the exact error this whole
+// change exists to prevent. A stamp becomes an instant only if it was written as one.
+const ISO_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Reads whatever an advice-log entry recorded in its header brackets.
+ *
+ * Returns the ISO instant when the entry carries one, and otherwise `at: null` with the raw text
+ * preserved — never a date guessed from the parse.
+ */
+export function readStamp(raw) {
+    const text = String(raw ?? "").trim();
+    if (!ISO_STAMP.test(text)) return { at: null, time: text };
+    const ms = Date.parse(text);
+    if (!Number.isFinite(ms)) return { at: null, time: text };
+    return { at: new Date(ms).toISOString(), time: text };
+}
+
+/** Renders an ISO instant as a full local date and time. Empty for anything unparseable. */
+export function formatStamp(iso) {
+    const date = new Date(iso ?? NaN);
+    return Number.isNaN(date.getTime()) ? "" : date.toLocaleString(undefined, STAMP_FORMAT);
+}
+
+/**
+ * The one answer to "when did this happen", for an entry from either era.
+ *
+ * Dated entries read as a full local date and time; undated ones keep the only thing they ever
+ * recorded and say outright that the date is missing.
+ */
+export function describeStamp(entry) {
+    const at = entry?.at ? formatStamp(entry.at) : "";
+    if (at) return at;
+    const time = String(entry?.time ?? "").trim();
+    return time ? `${time} \u2014 ${STAMP_UNKNOWN_DATE}` : "";
+}
+
+/**
+ * Rewrites one raw advice-log entry's header for reading, leaving the file itself untouched.
+ *
+ * The log is append-only history and stays exactly as written; this is the display of it, which
+ * is where the date belongs. An entry whose header does not parse is passed through verbatim,
+ * for the same reason `parseAdviceLog` surfaces it rather than dropping it.
+ */
+export function describeAdviceEntry(chunk) {
+    const text = String(chunk ?? "");
+    const newline = text.indexOf("\n");
+    const head = (newline === -1 ? text : text.slice(0, newline)).trim();
+    const match = ADVICE_HEADER.exec(head);
+    if (!match) return text;
+    const shown = describeStamp(readStamp(match[1]));
+    const header = `### [${shown}] ${match[2]} (${match[3]})`;
+    return newline === -1 ? header : header + text.slice(newline);
+}
+
 /**
  * Reads the session's advice log back into panel entries.
  *
@@ -225,10 +303,11 @@ export function parseAdviceLog(text, separator) {
                 return { seq: 0, at: null, time: "", tag: "review", title: "unparsed log entry", detail: truncateToBytes(chunk), logged: true };
             }
             const tag = match[2].toLowerCase();
+            const stamp = readStamp(match[1]);
             return {
                 seq: 0,
-                at: null,
-                time: match[1],
+                at: stamp.at,
+                time: stamp.time,
                 tag: ADVICE_TAGS.includes(tag) ? tag : "review",
                 title: truncateToBytes(match[3], 1024),
                 detail: truncateToBytes(body),
@@ -274,6 +353,20 @@ function clientScript(basePath) {
         "const BASE = " + JSON.stringify(basePath) + ";",
         "const LIMIT = " + JSON.stringify(ACTIVITY_LIMIT) + ";",
         "const TAGS = " + JSON.stringify(PANEL_TAGS) + ";",
+        // Formatted in the browser, so the reader sees their own local date and time rather than
+        // the extension host's. The server persists the instant; only the rendering is local.
+        "const STAMP_FORMAT = " + JSON.stringify(STAMP_FORMAT) + ";",
+        "const STAMP_UNKNOWN_DATE = " + JSON.stringify(STAMP_UNKNOWN_DATE) + ";",
+        "function stampOf(e) {",
+        "  if (e.at) {",
+        "    const d = new Date(e.at);",
+        "    if (!Number.isNaN(d.getTime())) { return d.toLocaleString(undefined, STAMP_FORMAT); }",
+        "  }",
+        // No `at` means the entry predates dated logging. Its date is not recoverable, and
+        // today's would be a lie, so the row says the date is missing instead.
+        "  const time = (e.time || '').trim();",
+        "  return time ? time + ' \\u2014 ' + STAMP_UNKNOWN_DATE : '';",
+        "}",
         // Every tag on by default, and unchecking removes one. The panel exists to show what the
         // advisor did, so the default has to be "all of it".
         "const active = new Set(TAGS);",
@@ -493,9 +586,12 @@ function clientScript(basePath) {
         "    item.dataset.kind = e.tag;",
         "    const meta = document.createElement('div');",
         "    meta.className = 'entry-meta';",
-        // Durable entries parsed back out of the advice log have no ISO timestamp, only the
-        // locale time the log recorded, so `at` is the preferred source and `time` the fallback.
-        "    const when = e.at ? new Date(e.at).toLocaleString() : (e.time || '');",
+        // Durable entries parsed back out of the advice log carry an ISO instant if the advisor
+        // recorded one, and nothing but a clock time if they predate that. Both are shown for
+        // what they are — a full local date and time, or a time that says its date is missing.
+        // Neither ever borrows today's date, which is how a week-old blocker came to be read as
+        // current.
+        "    const when = stampOf(e);",
         "    meta.textContent = [e.tag, e.title, when].filter(Boolean).join(' | ');",
         "    const message = document.createElement('p');",
         "    message.className = 'entry-message';",
