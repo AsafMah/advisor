@@ -25,6 +25,10 @@ import {
     isMainAgentStop,
     downgradeUnfoundedUserClaim,
     USER_CLAIM_PATTERN,
+    classifyPrompt,
+    isAdvisorFollowUp,
+    PROMPT_OWNER_MAIN,
+    PROMPT_OWNER_SUB_AGENT,
 } from "./lib.mjs";
 
 const fence = "```";
@@ -618,5 +622,123 @@ test("formatTimelineAdvice", async (t) => {
     await t.test("the suffix is included when given", () => {
         const out = formatTimelineAdvice({ severity: "nit", note: "x" }, " (stale)");
         assert.ok(out.includes("(stale)"));
+    });
+});
+
+// The observed failure this guards: a `task` sub-agent's opening prompt reached the advisor as if
+// the user had typed it, became the goal, and entered `userPrompts` — the record a blocker is
+// corroborated against — so the advisor denied the main agent's tool calls over a "user
+// requirement" that was in fact its own sub-agent's instructions.
+test("classifyPrompt", async (t) => {
+    const user = { content: "Fix the advisor extension and commit", agentId: null, source: null };
+
+    await t.test("a prompt the user typed is the goal and is trusted evidence", () => {
+        assert.deepEqual(classifyPrompt(user), {
+            owner: PROMPT_OWNER_MAIN,
+            isUserAuthored: true,
+            setsGoal: true,
+            reason: "user",
+        });
+    });
+
+    // Both id shapes are checked because sub-agents appear as a bare UUID or with a `bg-` prefix
+    // depending on how they were started; a prefix match would let one of them through.
+    for (const agentId of ["b9f40414-1e8f-4a0e-9d6d-2a4f1c0e77aa", "bg-547f4c1b"]) {
+        await t.test(`a sub-agent prompt (${agentId.slice(0, 6)}…) is not this session's turn`, () => {
+            const c = classifyPrompt({
+                content: "Implement ONLY minimal LeanTypeDual branding",
+                agentId,
+                source: "agent-a1c3e5f7-0b2d-4e6f-8a91-3c5d7e9f0b24",
+            });
+            assert.equal(c.owner, PROMPT_OWNER_SUB_AGENT);
+            assert.equal(c.isUserAuthored, false);
+            assert.equal(c.setsGoal, false);
+        });
+    }
+
+    // The advisor's own review agent is a sub-agent like any other. Its prompt quotes the
+    // transcript back at itself, so admitting it would let the advisor corroborate a claim
+    // against text it wrote.
+    await t.test("the advisor's own review prompt is a sub-agent prompt", () => {
+        const c = classifyPrompt({
+            content: "You are an ADVISOR reviewing another agent's work...",
+            agentId: "df60fc63-2b11-4f7a-9c31-0d9b1f2a4e55",
+            source: "agent-a1c3e5f7-0b2d-4e6f-8a91-3c5d7e9f0b24",
+        });
+        assert.equal(c.owner, PROMPT_OWNER_SUB_AGENT);
+        assert.equal(c.isUserAuthored, false);
+    });
+
+    // Ownership and authority are separate axes: this steers the work, so it sets the goal, but
+    // an operator session is not the user.
+    await t.test("a cross-session message steers the work without speaking for the user", () => {
+        const c = classifyPrompt({
+            content: "Proceed with the event-ownership fix and post-tool delivery",
+            agentId: null,
+            source: "agent-c4e6a8b0-1d3f-4a5c-9e72-6b8d0f2a4c61",
+        });
+        assert.equal(c.owner, PROMPT_OWNER_MAIN);
+        assert.equal(c.setsGoal, true);
+        assert.equal(c.isUserAuthored, false);
+    });
+
+    await t.test("a system injection is not the user either", () => {
+        const c = classifyPrompt({ content: "<system-reminder>", agentId: null, source: "system" });
+        assert.equal(c.isUserAuthored, false);
+        assert.equal(c.setsGoal, true);
+    });
+
+    // The host re-delivers a blocked stop as a user message containing the advisor's own words.
+    // It must not become the goal — that would replace the real objective with a critique of it —
+    // and must never be evidence.
+    await t.test("the host's <advisor> follow-up is neither goal nor evidence", () => {
+        const c = classifyPrompt({
+            content: '<advisor severity="blocker">\nStop and reconsider.\n</advisor>\nThe above is from...',
+            agentId: null,
+            source: null,
+        });
+        assert.equal(c.owner, PROMPT_OWNER_MAIN);
+        assert.equal(c.setsGoal, false);
+        assert.equal(c.isUserAuthored, false);
+        assert.equal(c.reason, "advisor-follow-up");
+    });
+
+    // Recognised from the text, so it still holds for a prompt that arrived with no event to
+    // attribute it.
+    await t.test("an unattributed prompt fails open, except an <advisor> follow-up", () => {
+        assert.equal(classifyPrompt(null).isUserAuthored, true);
+        assert.equal(classifyPrompt(undefined).setsGoal, true);
+        assert.equal(isAdvisorFollowUp('  <advisor severity="nit">x</advisor>'), true);
+        assert.equal(isAdvisorFollowUp("please use <advisor> tags"), false);
+        assert.equal(isAdvisorFollowUp(null), false);
+    });
+});
+
+// End-to-end over the pure logic: replays the episode's prompt sequence and asserts the blocker it
+// produced no longer survives. Before the fix the sub-agent prompt was in `userPrompts`, so the
+// quoted phrase corroborated and the blocker stood.
+test("a sub-agent prompt cannot corroborate a blocker", async (t) => {
+    const trusted = [];
+    const seen = [
+        { content: "Fix advisor feedback delivery under autopilot", agentId: null, source: null },
+        {
+            content: "Implement ONLY minimal LeanTypeDual branding",
+            agentId: "b9f40414-1e8f-4a0e-9d6d-2a4f1c0e77aa",
+            source: "agent-a1c3e5f7-0b2d-4e6f-8a91-3c5d7e9f0b24",
+        },
+    ];
+    for (const record of seen) {
+        const c = classifyPrompt(record);
+        if (c.owner === PROMPT_OWNER_MAIN && c.isUserAuthored) trusted.push(record.content);
+    }
+    assert.deepEqual(trusted, ["Fix advisor feedback delivery under autopilot"]);
+
+    await t.test("the blocker is downgraded rather than denying a tool call", () => {
+        const advice = {
+            severity: "blocker",
+            note: 'The user asked to "Implement ONLY minimal LeanTypeDual branding" — this exceeds it.',
+        };
+        assert.equal(downgradeUnfoundedUserClaim(advice, trusted), true);
+        assert.equal(advice.severity, "concern");
     });
 });

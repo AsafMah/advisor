@@ -176,6 +176,94 @@ Log paths are suffixed with the session id, so `advisor-advice.log` becomes
 
 Session overrides are in-memory and reset when extensions reload.
 
+## The `advisor_control` tool
+
+The app does not surface extension slash commands ([github/app#3056][cmd-issue]), so every command
+above is also reachable as a tool the agent can call when you ask about the advisor.
+
+| Operation      | Effect                                                              |
+| -------------- | ------------------------------------------------------------------- |
+| `status`       | Same content as `/advisor`.                                          |
+| `log`          | Same as `/advisor-log`; takes `count`.                               |
+| `review`       | Queues a review. See below.                                          |
+| `enable` / `disable` | As `/advisor-on` / `/advisor-off`.                             |
+| `set_model`    | Takes `model`.                                                       |
+| `set_cadence`  | Takes `everyNToolCalls`.                                             |
+| `reload_config`| Re-reads `advisor.json`.                                             |
+
+Three properties are deliberate:
+
+- **The five changing operations ask you to confirm** through `session.ui.confirm`, naming the exact
+  change, before they take effect. A host with no elicitation support throws rather than returning
+  an answer, so unavailable and declined are treated identically — a host that cannot ask you cannot
+  have been answered by you. There is no argument an agent can set to claim you already approved.
+  The slash commands are unchanged: you typed those yourself, so there is nothing to confirm.
+- **`review` is queued, not run inside the call.** Starting a sub-agent and awaiting it from inside
+  an open tool call nests one host round-trip inside another, and the review would be reading a
+  transcript that does not yet contain the call that asked for it. The request is released by that
+  tool call's own `tool.execution_complete`. The result says only that a review was queued: handing
+  the note back as tool output would be a second delivery path bypassing the severity and blocker
+  policy, delivering a blocker as ordinary text while it was still pending for the deny path.
+- **Reads are open; changing the advisor and asking it to review are main-agent only.** A `task`
+  sub-agent must not retune the advisor for a session it is only one part of, and the advisor's own
+  review agent can see this tool — without the gate it could switch itself off, or start a second
+  review of itself and disturb the cadence and pending state of the review already running. The gate
+  runs before the confirmation, so a sub-agent cannot raise a dialog in your face.
+
+Every attempted change is recorded in the activity panel, whether it was confirmed or declined.
+Reads are not: the audit records control invocations, not calls to the helpers they share with the
+panel, which re-reads state on every status tick.
+
+## The activity panel
+
+`advisor-activity` is a read-only canvas showing what the advisor has actually done this session:
+advice raised at every severity — **including advice dropped below `minSeverityToInject`**, with the
+reason — plus reviews, control changes and errors. Wiring it to the delivery path instead would hide
+every outcome that was dropped, which is the most diagnostic data there is.
+
+It updates live while open and restores durable history on reopen or reload, reconstructed from the
+advice log. History longer than the retained window is shown with a truncation notice rather than
+silently trimmed. The panel serves on loopback with a per-session token, checks `Host` and `Origin`,
+and renders every dynamic value through `textContent`, so text in an advice note is structurally
+incapable of becoming markup.
+
+Activity is listed newest first and narrowed by two filters that compose: a checkbox per kind, so
+several severities can be watched at once, and a free-text search over titles and notes. The layout
+deliberately mirrors the self-learn activity panel so the two read as one product.
+
+Every row carries a full local date and time, not a bare clock time — a row reading `11:00:02` was
+once taken for current when it was eight days old. The advice log stores an ISO instant and the
+panel renders it in the reader's own timezone, so entries either side of midnight read as different
+days. Entries written before the advisor recorded dates are shown as `11:00:02 — date unavailable`:
+their date is genuinely unrecoverable, and today's date or the file's mtime would both be wrong,
+the second more convincingly. The log is never rewritten or backfilled to close that gap.
+
+### Changing settings from the panel
+
+The panel can change three things for the running session: whether the advisor is enabled, the
+review model, and the review cadence. Everything else — the policy knobs, `reload_config`, starting
+a review — stays with the command and the tool, because those are either the model's business or a
+decision this UI has no way to confirm safely.
+
+Editing a field previews the exact before-and-after of every field that changed, directly above a
+single **Apply** button; **Reset** discards the edits and puts the advisor's own values back. The
+preview costs no click, so the change is on screen next to the button that sends it. Nothing leaves
+the document until Apply, and every press of Apply writes a line saying what happened — including
+when it did nothing, because a silent button is indistinguishable from a broken one. Applying starts
+no review and sends no message: it changes the session's settings and nothing else. The changes are
+session overrides only and never touch the config file, and they are recorded in the activity feed
+as coming from the panel, separately from the same change made by a slash command or by the tool —
+the tool is the model asking, and the model is the thing under review.
+
+Applies are atomic and checked against the state the form was filled from, so a setting changed
+elsewhere while the form was open is refused rather than quietly overwritten. If a reply is
+lost in flight the panel says the outcome is **unknown** and locks the form rather than claiming
+nothing happened; only a successful refresh resolves it.
+
+Opening it is up to you — the extension never opens it for you. There are no OS notifications.
+
+[cmd-issue]: https://github.com/github/app/issues/3056
+
 ## What the advisor sees
 
 Each review is given four things:
@@ -247,7 +335,9 @@ Advice is delivered into the agent's context, where you cannot see it. Two thing
   deliberately does not default to `error`: see
   [Advice is not a session failure](#advice-is-not-a-session-failure).
 - **The advice log.** A human-readable record of every outcome: raised, injected, denied, dropped
-  as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup.
+  as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup. Each
+  entry is stamped with an ISO instant; `/advisor-log` renders that as a local date and time, and
+  labels an older, undated entry rather than guessing a date for it.
 
 Log paths are suffixed with the session id, because otherwise concurrent sessions interleave
 their entries into a single unreadable file.
@@ -361,9 +451,22 @@ Layer 3 depends on the record of user prompts being genuinely the user's. It was
 opening prompt is dispatched to `onUserPromptSubmitted` like any other, so every `task` sub-agent's
 brief — and the advisor's own review prompt, which embeds the whole transcript — was being recorded
 as something the user had said. That both replaced the goal under review and let arbitrary
-transcript text corroborate a blocker claiming to quote the user. Observed in the wild: the advisor
-denied a main-agent tool call over a "user requirement" that was a sub-agent's task prompt. Hooks
-are now attributed to an agent before they are acted on — see "Only the main agent is watched".
+transcript text corroborate a blocker claiming to quote the user. Observed in the wild repeatedly:
+the advisor denies a main-agent tool call over a "user requirement" that is a sub-agent's task
+prompt, including against the very session writing this paragraph.
+
+The first attempt at a guard resolved the hook's caller from the `hook.start` bracket around it, as
+`onPreToolUse` does. That guard was dead on arrival and stayed dead for a month: measured on
+1.0.84-5, the bracket for `userPromptSubmitted` carries no `agentId` at all — unlike every other
+hook — so the check could never be satisfied and every prompt fell through as the main agent's. To
+confirm the guard is live rather than merely present, grep an episode log for `ignoring sub-agent
+prompt` in a session where a `task` sub-agent ran; a guard that is working leaves a line there.
+
+Prompts are therefore classified from the `user.message` **event**, which does carry `agentId`,
+rather than from a hook. Correlating the hook to its event was rejected on measurement, not taste:
+the event arrives ~273 ms after the hook is entered, so any bounded wait is a race that fails open
+under load — the precise failure being fixed. The event path has no window to lose. See
+`classifyPrompt` in `lib.mjs` for what each provenance grants.
 
 ## Development
 
@@ -393,7 +496,30 @@ JSON but not a verdict must not be accepted.
 ## Design notes
 
 - **Non-blocking.** The review runs as a detached background task; the main agent never waits.
-  Advice lands on the next tool call after the advisor finishes.
+  Advice lands on the next tool call after the advisor finishes, delivered two ways for two
+  different reasons:
+  - `onPreToolUse` returns it as `additionalContext` *before* a tool runs, so a `blocker` can also
+    deny the call. This is the enforcement path.
+  - `onPostToolUse` returns it as `additionalContext` *after* a tool runs. There is no
+    `permissionDecision` to withhold at that point, so this path deliberately declines blockers
+    while `blockOnBlocker` is on: consuming one here would retire the denial the setting promises.
+    It exists so advice that arrives with no further tool call to carry it still reaches the agent
+    inside the turn, correctly attributed, instead of waiting for the stop boundary.
+
+  Both are attributed to the hook, not to the user. The stop boundary is not — see below.
+- **Advice at a stop boundary is attributed to the user, and that is a host limitation.** When a
+  `blocker` is still pending as the agent stops, `onAgentStop` returns `{decision: "block",
+  reason}`, and the host re-delivers that `reason` into the session as a queued `user.message`
+  containing the advisor's words verbatim. The agent receives its reviewer's opinion as though the
+  user had typed it. This is not a workaround the extension chose: `AgentStopHookOutput` accepts
+  only `decision` and `reason` and has no `additionalContext` field, and `session.send` has no
+  source or attribution option, so no supported mechanism reaches an agent at its stop boundary
+  without a synthetic user turn. Keeping the block — accepting the attribution rather than losing
+  end-of-turn enforcement — is a deliberate decision. Two things contain the damage: `formatAdvice`
+  opens with an `<advisor>` element naming an independent reviewer that may be wrong, and
+  `classifyPrompt` recognises that element on the way back in, so the advisor never treats its own
+  returned text as evidence of what the user wants. Remove the block when a stop hook can return
+  `additionalContext`.
 - **Reply recovery.** The reply is read in order of reliability: `task.result`, then
   `task.latestResponse`, then the session event log. The first two are keyed by the task id the
   extension owns, so they cannot bind to a foreign agent. The event-log fallback exists because
@@ -404,12 +530,14 @@ JSON but not a verdict must not be accepted.
   guessing by model or by "first agent after my baseline" will eventually bind to another
   extension's sub-agent and parse its output as a verdict.
 - **Only the main agent is watched.** Sub-agent events carry an `agentId`; main-agent events do
-  not. Every trigger path filters on it: the transcript, the in-flight set, and the tool-call
-  counter that drives the cadence. Extension hooks need more work, because they are dispatched for
-  sub-agents too and their payload carries no agent identity — the `invocation` argument holds
-  only `sessionId`. The event log brackets each hook dispatch in `hook.start`/`hook.end` events
-  that *do* carry `agentId`, so `onUserPromptSubmitted` and `onPreToolUse` resolve their caller
-  from the bracket open around them. Without this the advisor reads its own review prompt as the
+  not. Every trigger path filters on it: the transcript, the in-flight set, the tool-call
+  counter that drives the cadence, and prompt classification. Extension hooks need more work,
+  because they are dispatched for sub-agents too and their payload carries no agent identity — the
+  `invocation` argument holds only `sessionId`. The event log brackets each hook dispatch in
+  `hook.start`/`hook.end` events that *do* carry `agentId`, so `onPreToolUse` and `onPostToolUse`
+  resolve their caller from the bracket open around them. This does **not** work for every hook:
+  the `userPromptSubmitted` bracket carries no `agentId`, which is why prompts are classified from
+  the `user.message` event instead. Without all this the advisor reads its own review prompt as the
   user's goal, counts its own file reads as the main agent working, and delivers advice about the
   main agent into a sub-agent that cannot act on it. None of this stands the advisor down while a
   sub-agent runs: advice stays pending and is delivered on the main agent's next tool call.

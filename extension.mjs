@@ -3,8 +3,8 @@
 //
 // Inspired by oh-my-pi's WATCHDOG advisor. See README.md.
 
-import { joinSession } from "@github/copilot-sdk/extension";
-import { readFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
+import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
+import { readFileSync, existsSync, appendFileSync, mkdirSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, isAbsolute } from "node:path";
 
@@ -23,7 +23,23 @@ import {
     formatTimelineAdvice,
     isMainAgentStop,
     downgradeUnfoundedUserClaim,
+    classifyPrompt,
+    PROMPT_OWNER_SUB_AGENT,
 } from "./lib.mjs";
+
+// The activity panel — the ring the canvas renders, and the loopback server it talks to. Kept in
+// its own module for the same reason as lib.mjs: it can be imported by a test, and this file
+// cannot.
+import {
+    ACTIVITY_LIMIT,
+    ADVICE_TAGS,
+    SETTINGS_KEYS,
+    createActivityLog,
+    createPanelServer,
+    describeAdviceEntry,
+    mergeDurableHistory,
+    parseAdviceLog,
+} from "./panel.mjs";
 
 // The CLI's config directory can be relocated, so derive it rather than assuming ~/.copilot.
 const CONFIG_DIR = process.env.COPILOT_CONFIG_DIR || join(homedir(), ".copilot");
@@ -164,6 +180,11 @@ const state = {
 
 const cfg = (key) => state.sessionOverrides[key] ?? config[key];
 
+// What the activity panel shows. Separate from `state` because it is a bounded append-only
+// record rather than turn state: `resetTurn` must not clear it, or the panel would forget
+// everything the moment the user sent another message.
+const activity = createActivityLog();
+
 // Every session writes to the same configured path, so without a per-session suffix concurrent
 // sessions interleave their entries into one unreadable file. A relative path resolves against
 // the CLI's log directory so shared configs carry no machine-specific paths.
@@ -193,14 +214,36 @@ function debug(message) {
 // the file printed at startup.
 function recordAdvice(severity, note, outcome) {
     const path = sessionScopedPath(cfg("adviceLog"));
-    if (!path) return;
-    const stamp = new Date().toLocaleTimeString();
-    const entry = `${ADVICE_ENTRY_SEPARATOR}\n### [${stamp}] ${severity.toUpperCase()} (${outcome})\n${note}\n`;
-    try {
-        appendFileSync(path, entry);
-    } catch {
-        // Never break the review loop over logging.
+    let logged = false;
+    if (path) {
+        // An instant, not a clock time. The log is durable and is read days later, where
+        // `11:00:02` is indistinguishable from "just now" — that misreading is what this format
+        // exists to prevent. ISO is stored because it is unambiguous and sorts; the panel and
+        // `/advisor-log` render it into the reader's own local date and time.
+        const stamp = new Date().toISOString();
+        const entry = `${ADVICE_ENTRY_SEPARATOR}\n### [${stamp}] ${severity.toUpperCase()} (${outcome})\n${note}\n`;
+        try {
+            appendFileSync(path, entry);
+            logged = true;
+        } catch {
+            // Never break the review loop over logging.
+        }
     }
+
+    // The panel is fed from here, and not from the hooks, because this is the one funnel every
+    // outcome already passes through — raised, injected, denied, duplicate, stale, blocked,
+    // undelivered. A panel wired to the delivery hooks instead would show only advice that
+    // landed, and silently omit everything that was dropped, which is precisely what someone
+    // watching the advisor most needs to see.
+    //
+    // `logged` records whether this also reached the advice log, which is what lets
+    // `mergeDurableHistory` work out exactly how much of that file the ring is already showing.
+    activity.push({
+        tag: ADVICE_TAGS.includes(severity) ? severity : "review",
+        title: outcome,
+        detail: note,
+        logged,
+    });
 }
 
 function renderEvent(event) {
@@ -326,8 +369,21 @@ function collectInFlight() {
 // carry `agentId`, correlated by `hookInvocationId`. `hook.start` reaches the extension before
 // the handler runs and `hook.end` only after it returns, so a handler can ask which agent it is
 // running for by looking at the bracket that is open around it.
-const HOOK_USER_PROMPT_SUBMITTED = "userPromptSubmitted";
+//
+// This works for the tool-use hooks and only for those. Measured on host 1.0.84-5, with a real
+// `task` sub-agent:
+//
+//   hook                              agentId    parentToolCallId
+//   preToolUse   (sub-agent tool)     set        set
+//   postToolUse  (sub-agent tool)     set        set
+//   userPromptSubmitted (sub-agent)   null       null
+//
+// A sub-agent's opening prompt is therefore unattributable at the hook, which is why prompts are
+// classified from the `user.message` event instead — see `handleUserMessage`. Re-run the check
+// before relying on the prompt bracket again: if the last column ever fills in, this comment is
+// what is out of date, not the code.
 const HOOK_PRE_TOOL_USE = "preToolUse";
+const HOOK_POST_TOOL_USE = "postToolUse";
 
 // A bracket whose end is somehow never seen would otherwise sit open forever.
 const MAX_OPEN_HOOK_DISPATCHES = 64;
@@ -362,6 +418,37 @@ async function hookIsForSubAgent(hookType, matches) {
     const matched = open.filter((d) => matches(d.input));
     const candidates = matched.length ? matched : open;
     return candidates.length > 0 && candidates.every((d) => d.agentId);
+}
+
+// The same problem one level over, for the extension's own tool. A registered tool is offered to
+// `task` sub-agents as well as to the main agent, and `ToolInvocation` carries no agent identity
+// — only `sessionId`, `toolCallId`, `toolName` and `arguments`. The caller is recoverable from
+// the event log: `external_tool.requested` carries the same `toolCallId`, and an `agentId` that
+// the SDK documents as "absent for events from the root/main agent".
+//
+// This matters more than it looks. The advisor spawns a review sub-agent of its own, and that
+// agent can see this tool; without the guard it could disable the very review it is running.
+const MAX_SUB_AGENT_TOOL_CALLS = 64;
+const subAgentToolCalls = new Set();
+
+function noteExternalToolRequested(event) {
+    const id = event?.data?.toolCallId;
+    if (!id || !event?.agentId) return;
+    subAgentToolCalls.add(id);
+    // A Set iterates in insertion order, so the first value is the oldest.
+    if (subAgentToolCalls.size > MAX_SUB_AGENT_TOOL_CALLS) {
+        subAgentToolCalls.delete(subAgentToolCalls.values().next().value);
+    }
+}
+
+async function toolCallIsFromSubAgent(invocation) {
+    // Same ordering caveat as `hookIsForSubAgent`, and the reason a naive lookup always misses:
+    // the SDK invokes the handler from inside its own dispatch of `external_tool.requested`,
+    // synchronously, before that event reaches `session.on`. Yielding once lets the listener
+    // record the call first, which makes this ordered rather than a race.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const id = invocation?.toolCallId;
+    return Boolean(id) && subAgentToolCalls.has(id);
 }
 
 async function buildTranscriptDelta(session) {
@@ -837,6 +924,10 @@ async function runCheck(session, { force = false } = {}) {
     } catch (err) {
         state.lastError = err?.message ?? String(err);
         debug(`ERROR: ${state.lastError}`);
+        // Failures never reach the advice log, so the panel would show a healthy-looking history
+        // for an advisor that has not completed a review in an hour. Recorded here so the panel
+        // shows what actually happened rather than an empty list that reads as "all clear".
+        activity.push({ tag: "error", title: "review failed", detail: state.lastError });
 
         // A misconfigured advisor would otherwise fail every review in silence, visible only in
         // the debug log. Surface each distinct failure once so it cannot go unnoticed.
@@ -878,43 +969,492 @@ function takePendingAdvice() {
     return advice;
 }
 
-const session = await joinSession({
-    hooks: {
-        onUserPromptSubmitted: async (input) => {
-            // A sub-agent's opening prompt is dispatched here too, the advisor's own review
-            // prompt included. Adopting one as the user's goal is not merely noisy: `userPrompts`
-            // is the trusted record `downgradeUnfoundedUserClaim` corroborates against, so a
-            // sub-agent prompt landing there lets text the advisor only read back to itself pass
-            // as the user's own words. Observed: the advisor denied a main-agent tool call over a
-            // "user requirement" that was in fact a sub-agent's task prompt.
-            const forSubAgent = await hookIsForSubAgent(
-                HOOK_USER_PROMPT_SUBMITTED,
-                (i) => i?.prompt === input?.prompt,
-            );
-            if (forSubAgent) {
-                debug(`ignoring sub-agent prompt: ${truncate(input?.prompt ?? "", 120)}`);
-                return;
-            }
+// Split out of the hook so the ordering is explicit: every reason to decline is checked before
+// `takePendingAdvice` is called, because that call consumes. Getting this backwards would drop
+// advice on the floor for a sub-agent's tool call.
+async function takeAdviceForPostToolUse(input) {
+    // A blocker is enforcement, not commentary. Delivering one here would consume it without
+    // denying anything, so it is left pending for `onPreToolUse` to deny or `onAgentStop` to
+    // block. When `blockOnBlocker` is off there is no denial to preserve and it travels like any
+    // other note. Checked before consuming, and on the pending value rather than a taken one.
+    const pending = state.pendingAdvice;
+    if (!pending) return null;
+    if (pending.severity === "blocker" && cfg("blockOnBlocker")) return null;
 
-            state.goal = input.prompt ?? "";
-            // Kept across turns: this is the only trusted record of what the user actually asked
-            // for, and a later "continue" must not erase an earlier requirement.
-            if (input.prompt) {
-                state.userPrompts.push(input.prompt);
-                if (state.userPrompts.length > USER_PROMPT_HISTORY_LIMIT) state.userPrompts.shift();
-            }
-            state.toolCallsThisTurn = 0;
-            state.toolCallsSinceCheck = 0;
-            state.pendingAdvice = null;
-            state.deferredTimelineAdvice = null;
-            // A new user turn proves the user is present and any prompt they were being shown is
-            // resolved. Clearing here is what stops a missed completion event silencing the
-            // advisor for the rest of the session: the guard fails open at the next turn.
-            state.openPrompts.clear();
-            state.lastAdviceNote = "";
-            state.activeCalls.clear();
+    // Same reasoning as the pre-tool guard: advice about the main agent's work is noise in a
+    // sub-agent's context, and the main agent would never see it.
+    const forSubAgent = await hookIsForSubAgent(
+        HOOK_POST_TOOL_USE,
+        (i) => i?.toolName === input?.toolName,
+    );
+    if (forSubAgent) return null;
+
+    // Injecting into the result of a question the user is answering is pointless, and the
+    // pre-tool hook already declines these for the same reason.
+    if (USER_INPUT_TOOLS.has(input?.toolName)) return null;
+
+    // Re-read rather than trusting `pending`: the guard above awaits, and `onPreToolUse` for the
+    // next call can resolve in that window and take this advice first.
+    if (!state.pendingAdvice) return null;
+    return takePendingAdvice();
+}
+
+// ---------------------------------------------------------------------------
+// Control layer
+//
+// One implementation per operation, shared by the slash commands, the `advisor_control` tool and
+// the activity canvas. Each returns structured data; the command handlers format it back into
+// the text they have always printed, so `/advisor` output is unchanged.
+//
+// The tool exists because the app does not surface extension slash commands (github/app#3056):
+// in that host every operation below would otherwise be unreachable.
+// ---------------------------------------------------------------------------
+
+function controlStatus() {
+    return {
+        enabled: cfg("enabled"),
+        model: cfg("model"),
+        agentType: cfg("agentType"),
+        everyNToolCalls: cfg("everyNToolCalls"),
+        currentInterval: currentInterval(),
+        immuneToolCalls: cfg("immuneToolCalls"),
+        blockOnBlocker: cfg("blockOnBlocker"),
+        configPath: config._configPath ?? null,
+        adviceLogPath: sessionScopedPath(cfg("adviceLog")),
+        checksRun: state.checksRun,
+        adviceDelivered: state.adviceDelivered,
+        toolCallsSinceCheck: state.toolCallsSinceCheck,
+        consecutiveQuietChecks: state.consecutiveQuietChecks,
+        checkInFlight: state.checkInFlight,
+        pendingAdvice: state.pendingAdvice ? state.pendingAdvice.severity : null,
+        lastError: state.lastError,
+    };
+}
+
+function formatStatus(s) {
+    return [
+        `enabled:        ${s.enabled}`,
+        `model:          ${s.model} (${s.agentType})`,
+        `cadence:        every ${s.everyNToolCalls} tool calls (currently ${s.currentInterval}, immune for first ${s.immuneToolCalls})`,
+        `block on:       ${s.blockOnBlocker ? "blocker" : "nothing"}`,
+        `config:         ${s.configPath ?? "built-in defaults"}`,
+        `advice log:     ${s.adviceLogPath ?? "disabled"}`,
+        `checks run:     ${s.checksRun}`,
+        `advice given:   ${s.adviceDelivered}`,
+        `tool calls:     ${s.toolCallsSinceCheck}/${s.currentInterval} since last check`,
+        `quiet streak:   ${s.consecutiveQuietChecks}`,
+        `in flight:      ${s.checkInFlight}`,
+        `pending advice: ${s.pendingAdvice ?? "none"}`,
+        `last error:     ${s.lastError ?? "none"}`,
+    ].join("\n");
+}
+
+// The advice log grows for the life of the session and nothing in this process caps it, so a
+// whole-file read is an unbounded allocation driven by how long the session ran. Only the tail is
+// ever displayed, so only the tail is read. A cut lands mid-entry, which the separator split then
+// discards as a partial leading chunk — the panel reports the truncation rather than implying the
+// history it shows is complete.
+const MAX_HISTORY_BYTES = 1024 * 1024;
+
+function readAdviceLog() {
+    const path = sessionScopedPath(cfg("adviceLog"));
+    if (!path) return { path: null, disabled: true, error: null, truncated: false, text: "" };
+    if (!existsSync(path)) return { path, disabled: false, error: null, truncated: false, text: "" };
+    try {
+        const size = statSync(path).size;
+        if (size <= MAX_HISTORY_BYTES) {
+            return { path, disabled: false, error: null, truncated: false, text: readFileSync(path, "utf8") };
+        }
+        const fd = openSync(path, "r");
+        try {
+            const buf = Buffer.allocUnsafe(MAX_HISTORY_BYTES);
+            const read = readSync(fd, buf, 0, MAX_HISTORY_BYTES, size - MAX_HISTORY_BYTES);
+            // The cut lands mid-entry, and mid-character too — decoding a partial UTF-8 sequence
+            // yields U+FFFD. Both are discarded by dropping everything before the first entry
+            // separator, so what is parsed is always whole entries.
+            const decoded = buf.subarray(0, read).toString("utf8");
+            const firstBoundary = decoded.indexOf(ADVICE_ENTRY_SEPARATOR);
+            const text = firstBoundary === -1 ? "" : decoded.slice(firstBoundary + ADVICE_ENTRY_SEPARATOR.length);
+            return { path, disabled: false, error: null, truncated: true, text };
+        } finally {
+            closeSync(fd);
+        }
+    } catch (err) {
+        return { path, disabled: false, error: err?.message ?? String(err), truncated: false, text: "" };
+    }
+}
+
+function controlReadAdvice(count) {
+    const log = readAdviceLog();
+    const entries = log.text
+        .split(ADVICE_ENTRY_SEPARATOR)
+        .map((e) => e.trim())
+        .filter(Boolean);
+    const take = Number.isFinite(count) && count > 0 ? count : 5;
+    return { ...log, total: entries.length, entries: entries.slice(-take) };
+}
+
+function formatAdviceLog(result) {
+    if (result.disabled) return "advisor: adviceLog is disabled in config";
+    if (result.error) return `advisor: could not read ${result.path}\n${result.error}`;
+    if (result.total === 0) return `advisor: no advice recorded yet this session\n${result.path}`;
+    return (
+        `advisor — last ${result.entries.length} of ${result.total} advice entries\n${result.path}\n\n` +
+        // Headers are rendered, not replayed: a stored instant becomes the reader's local date
+        // and time, and an entry from before the advisor recorded dates says so. The file on
+        // disk is unchanged either way.
+        result.entries.map(describeAdviceEntry).join("\n\n")
+    );
+}
+
+// Every control operation is recorded. The tool is reachable by the agent being reviewed, so
+// "the advisor went quiet" must always have a visible cause rather than being something that can
+// happen silently.
+//
+// The source is recorded too, because the three ways in do not carry the same authority. A slash
+// command is the user typing; the panel is the user's own hands on the controls, confirmed in the
+// panel's document; the tool is the *model* asking, and the model is the thing being reviewed. An
+// audit trail that cannot tell those apart cannot answer the question it exists for.
+const CONTROL_SOURCES = {
+    command: "a slash command",
+    tool: "the advisor_control tool",
+    panel: "the activity panel",
+};
+
+function noteControl(title, detail, source = "command") {
+    const via = CONTROL_SOURCES[source] ? source : "command";
+    const suffix = `via ${CONTROL_SOURCES[via]}`;
+    activity.push({ tag: "control", title, detail: detail ? `${detail} — ${suffix}` : suffix, source: via });
+    debug(`control (${via}): ${title}${detail ? ` — ${detail}` : ""}`);
+}
+
+function controlSetEnabled(enabled, source) {
+    state.sessionOverrides.enabled = enabled;
+    if (enabled) state.lastReportedError = null;
+    else state.pendingAdvice = null;
+    noteControl(enabled ? "advisor enabled" : "advisor disabled", enabled ? "" : "pending advice discarded", source);
+    return { enabled };
+}
+
+function controlSetModel(model, source) {
+    if (!model) return { model: cfg("model"), changed: false };
+    state.sessionOverrides.model = model;
+    noteControl("model changed", model, source);
+    return { model, changed: true };
+}
+
+function controlSetCadence(everyNToolCalls, source) {
+    if (!Number.isFinite(everyNToolCalls) || everyNToolCalls < 1) {
+        return { everyNToolCalls: cfg("everyNToolCalls"), changed: false };
+    }
+    state.sessionOverrides.everyNToolCalls = everyNToolCalls;
+    noteControl("cadence changed", `every ${everyNToolCalls} tool calls`, source);
+    return { everyNToolCalls, changed: true };
+}
+
+function controlReloadConfig(source) {
+    config = loadConfig(process.cwd());
+    state.sessionOverrides = {};
+    noteControl("config reloaded", config._configPath ?? "built-in defaults", source);
+    return { configPath: config._configPath ?? null };
+}
+
+function currentSettings() {
+    return { enabled: cfg("enabled"), model: cfg("model"), everyNToolCalls: cfg("everyNToolCalls") };
+}
+
+// The panel's write path. It does not go through `confirmChange`, and that is the point of the
+// distinction above: the tool's confirmation exists because the model asked for the change, and
+// the panel is not the model. The user has already been shown the exact change in the panel's own
+// document and pressed Apply there — asking a second time through a host dialog would be asking
+// the same person the same question, and doing it from an idle HTTP callback is the thing that
+// wedges the app.
+//
+// Values arrive already validated for shape and range by `parseSettingsRequest`, so everything
+// here is about whether the change still makes sense: the baseline the user confirmed against
+// must still be current, and either all three settings move or none do.
+function applyPanelSettings({ expected, desired }) {
+    const current = currentSettings();
+    const drifted = SETTINGS_KEYS.filter((key) => expected[key] !== current[key]);
+    if (drifted.length > 0) {
+        // A refusal is the one outcome with no activity entry — nothing changed, so nothing is
+        // worth showing the user in the feed. It still has to be visible *somewhere*: a panel
+        // write that vanishes without trace is exactly what made the last one hard to diagnose.
+        debug(`panel settings refused: stale baseline (${drifted.join(", ")})`);
+        return {
+            ok: false,
+            code: "stale",
+            message: `the advisor changed while you were reviewing (${drifted.join(", ")}) — check the current values and try again`,
+            settings: current,
+            status: controlStatus(),
+        };
+    }
+
+    const applied = SETTINGS_KEYS.filter((key) => desired[key] !== current[key]);
+    // Nothing below can fail, so there is no state in which one of the three has moved and the
+    // others have not.
+    if (applied.includes("model")) controlSetModel(desired.model, "panel");
+    if (applied.includes("everyNToolCalls")) controlSetCadence(desired.everyNToolCalls, "panel");
+    // Last, so that disabling discards advice the other two could not have produced in between.
+    if (applied.includes("enabled")) controlSetEnabled(desired.enabled, "panel");
+
+    return { ok: true, applied, settings: currentSettings(), status: controlStatus() };
+}
+
+// Re-reads the session's advice log on every explicit refresh rather than caching it: a cached
+// history would keep showing the ring's view after an extension reload, which is the one case
+// the durable record exists to cover. One session-scoped file, on a user action — not a scan of
+// every log, and never on the status poll.
+function panelSnapshot() {
+    const log = readAdviceLog();
+    const durable = log.error || log.disabled ? [] : parseAdviceLog(log.text, ADVICE_ENTRY_SEPARATOR);
+    return {
+        status: controlStatus(),
+        entries: mergeDurableHistory(durable, activity.list()),
+        historyError: log.error,
+        historyTruncated: log.truncated,
+        adviceLogPath: log.path,
+    };
+}
+
+const CONTROL_OPERATIONS = [
+    "status",
+    "review",
+    "log",
+    "enable",
+    "disable",
+    "set_model",
+    "set_cadence",
+    "reload_config",
+];
+const MUTATING_OPERATIONS = new Set(["enable", "disable", "set_model", "set_cadence", "reload_config"]);
+// `review` mutates nothing and needs no confirmation, but it starts a reviewer — so it is not a
+// read either. A sub-agent calling it would have the advisor review work on behalf of an agent
+// that is itself a subtask, and the advisor's own reviewer calling it would start a second
+// reviewer recursively and disturb the cadence and pending state of the review already running.
+const MAIN_AGENT_ONLY_OPERATIONS = new Set([...MUTATING_OPERATIONS, "review"]);
+
+// Tool calls that asked for a review, keyed by their own toolCallId.
+//
+// The review is deliberately NOT awaited inside the handler. Starting a sub-agent and waiting for
+// it from within an open tool call nests one host round-trip inside another, and the review would
+// in any case be reviewing a transcript that does not yet contain the call requesting it. So the
+// request is queued here and released by this tool call's own `tool.execution_complete`, which is
+// the first moment the call is genuinely over.
+const queuedManualChecks = new Set();
+// A queue entry is released by its own completion event, so one can only linger if that event
+// never arrives — an abandoned call. Bounded for the same reason `state.activeCalls` is pruned.
+const MAX_QUEUED_CHECKS = 8;
+
+function queueManualCheck(toolCallId) {
+    queuedManualChecks.add(toolCallId);
+    if (queuedManualChecks.size > MAX_QUEUED_CHECKS) {
+        queuedManualChecks.delete(queuedManualChecks.values().next().value);
+    }
+}
+
+function releaseQueuedCheck(event) {
+    const id = event?.data?.toolCallId;
+    if (!id || !queuedManualChecks.has(id)) return;
+    queuedManualChecks.delete(id);
+    // Fire and forget: findings travel the existing delivery paths, so there is nothing here to
+    // return to and nothing that should be able to reject into the event dispatcher.
+    runCheck(session, { force: true }).catch((err) => debug(`queued review failed: ${err?.message ?? err}`));
+}
+
+// A change asked for through the tool is asked for by the model, and the model is the thing being
+// reviewed — an audit trail makes that visible afterwards but is not authority for it. So every
+// mutating operation is confirmed by the user first, naming the exact change.
+//
+// The confirmation lives in the tool adapter and not in the control helpers, so the slash commands
+// keep their direct-user semantics: typing `/advisor-off` is already the user saying it.
+//
+// Anything other than an explicit yes leaves state untouched. `confirm` throws outright on a host
+// without elicitation, and a host that cannot ask cannot have been answered, so "unavailable" and
+// "declined" are deliberately the same answer rather than an excuse to proceed unasked.
+async function confirmChange(message) {
+    if (typeof session.ui?.confirm !== "function") return { confirmed: false, reason: "unavailable" };
+    try {
+        const answer = await session.ui.confirm(message);
+        return { confirmed: answer === true, reason: answer === true ? null : "declined" };
+    } catch (err) {
+        debug(`confirm unavailable: ${err?.message ?? err}`);
+        return { confirmed: false, reason: "unavailable" };
+    }
+}
+
+function notApplied(operation, reason) {
+    const why =
+        reason === "unavailable"
+            ? "this host cannot show a confirmation dialog"
+            : "the user declined";
+    noteControl(`${operation} not applied`, why, "tool");
+    return `advisor: ${operation} was NOT applied — ${why}.`;
+}
+
+// Deliberately described as something to call when the user asks about the advisor — and
+// explicitly not on finishing work. A tool whose description invites an agent to call it when it
+// is done gets called by every `task` sub-agent that finishes, which is the bug class this
+// extension was already fixed for once.
+const advisorControlTool = {
+    name: "advisor_control",
+    description:
+        "Read or control the advisor, the independent reviewer watching this session. " +
+        "Operations: status (current review state), log (recent advice), " +
+        "review (queue a review, which runs after this call and reports through the advisor's own " +
+        "channels, not in this call's result), " +
+        "enable, disable, set_model, set_cadence, reload_config. " +
+        "The five changing operations ask the user to confirm before taking effect. " +
+        "Call this when the user asks about the advisor or asks to change it. " +
+        "Do not call it to announce that you have finished work.",
+    parameters: {
+        type: "object",
+        properties: {
+            operation: { type: "string", enum: CONTROL_OPERATIONS, description: "Which operation to perform." },
+            model: { type: "string", description: "Model id. Only used by set_model." },
+            everyNToolCalls: {
+                type: "integer",
+                minimum: 1,
+                description: "Tool calls between reviews. Only used by set_cadence.",
+            },
+            count: {
+                type: "integer",
+                minimum: 1,
+                description: "How many advice entries to return. Only used by log; defaults to 5.",
+            },
         },
+        required: ["operation"],
+        additionalProperties: false,
+    },
+    handler: async (args, invocation) => {
+        const operation = args?.operation;
+        if (!CONTROL_OPERATIONS.includes(operation)) {
+            return `advisor: unknown operation ${JSON.stringify(operation ?? null)}. One of: ${CONTROL_OPERATIONS.join(", ")}`;
+        }
 
+        // Reads are harmless from anywhere. Changing the advisor is session-wide, and asking it to
+        // review is asking it to start a reviewer, so both stay with the main agent: a `task`
+        // sub-agent must not retune the advisor for the session it is only part of, and the
+        // advisor's own review agent must not be able to switch itself off or start a second
+        // review of itself.
+        if (MAIN_AGENT_ONLY_OPERATIONS.has(operation) && (await toolCallIsFromSubAgent(invocation))) {
+            return `advisor: ${operation} is available to the main agent only, not to a sub-agent.`;
+        }
+
+        switch (operation) {
+            case "status":
+                return `advisor status\n${formatStatus(controlStatus())}`;
+            case "log":
+                return formatAdviceLog(controlReadAdvice(args?.count));
+            case "review": {
+                // Queued rather than awaited, and it returns no severity: see `queuedManualChecks`
+                // for why waiting here is the wrong shape, and note that returning the advice text
+                // would be a second delivery path bypassing the severity and blocker policy —
+                // a blocker would arrive as ordinary tool output while still pending for the deny
+                // path. Findings keep their existing channels.
+                if (!cfg("enabled")) return "advisor: disabled for this session — no review started.";
+                if (!invocation?.toolCallId) return "advisor: cannot queue a review for an unidentified tool call.";
+                queueManualCheck(invocation.toolCallId);
+                return "advisor: review queued. Findings arrive on the usual advisor channels, not here.";
+            }
+            case "enable": {
+                const { confirmed, reason } = await confirmChange("Enable the advisor for this session?");
+                if (!confirmed) return notApplied("enable", reason);
+                controlSetEnabled(true, "tool");
+                return "advisor: enabled";
+            }
+            case "disable": {
+                const { confirmed, reason } = await confirmChange(
+                    "Disable the advisor for this session? It will stop reviewing this agent's work until re-enabled.",
+                );
+                if (!confirmed) return notApplied("disable", reason);
+                controlSetEnabled(false, "tool");
+                return "advisor: disabled for this session. Re-enable with advisor_control operation=enable.";
+            }
+            case "set_model": {
+                const requested = args?.model;
+                if (!requested) return `advisor model: ${cfg("model")}`;
+                const { confirmed, reason } = await confirmChange(
+                    `Change the advisor's review model from ${cfg("model")} to ${requested}?`,
+                );
+                if (!confirmed) return notApplied("set_model", reason);
+                return `advisor model set to ${controlSetModel(requested, "tool").model}`;
+            }
+            case "set_cadence": {
+                const requested = args?.everyNToolCalls;
+                if (!Number.isFinite(requested) || requested < 1) {
+                    return `advisor cadence: every ${cfg("everyNToolCalls")} tool calls`;
+                }
+                const { confirmed, reason } = await confirmChange(
+                    `Change the advisor's review cadence from every ${cfg("everyNToolCalls")} tool calls to every ${requested}?`,
+                );
+                if (!confirmed) return notApplied("set_cadence", reason);
+                return `advisor will review every ${controlSetCadence(requested, "tool").everyNToolCalls} tool calls`;
+            }
+            default: {
+                const { confirmed, reason } = await confirmChange(
+                    "Reload advisor config from disk? This discards any per-session advisor settings.",
+                );
+                if (!confirmed) return notApplied("reload_config", reason);
+                return `advisor config reloaded from ${controlReloadConfig("tool").configPath ?? "built-in defaults"}`;
+            }
+        }
+    },
+};
+
+// One loopback server per open panel, keyed by the host's instance id. Re-opening an id is how
+// the host focuses an existing panel and how it rehydrates after a reload, so `open` must return
+// the existing URL rather than start a second server on a second port.
+const panels = new Map();
+
+const activityCanvas = createCanvas({
+    id: "advisor-activity",
+    displayName: "Advisor activity",
+    description: "Live advisor review state, and the advice raised, delivered or dropped in this session.",
+    actions: [
+        {
+            name: "refresh",
+            description: "Ask any open advisor panel to re-read its data.",
+            handler: (ctx) => {
+                const panel = panels.get(ctx?.instanceId);
+                if (!panel) return { refreshed: false, reason: "no open advisor panel with that instance id" };
+                return { refreshed: true, renderers: panel.refresh() };
+            },
+        },
+    ],
+    open: async (ctx) => {
+        let panel = panels.get(ctx.instanceId);
+        if (!panel) {
+            panel = await createPanelServer({
+                title: "Advisor activity",
+                getSnapshot: panelSnapshot,
+                getStatus: controlStatus,
+                subscribe: activity.subscribe,
+                applySettings: applyPanelSettings,
+                onError: (err) => debug(`panel server error: ${err?.message ?? err}`),
+            });
+            panels.set(ctx.instanceId, panel);
+            debug(`panel opened for instance ${ctx.instanceId} on port ${panel.port}`);
+        }
+        return {
+            title: "Advisor activity",
+            url: panel.url,
+            status: cfg("enabled") ? "watching" : "disabled",
+        };
+    },
+    onClose: async (ctx) => {
+        const panel = panels.get(ctx.instanceId);
+        if (!panel) return;
+        panels.delete(ctx.instanceId);
+        await panel.close();
+        debug(`panel closed for instance ${ctx.instanceId}`);
+    },
+});
+
+const session = await joinSession({
+    tools: [advisorControlTool],
+    canvases: [activityCanvas],
+    hooks: {
         onPreToolUse: async (input) => {
             // Sub-agent tool calls reach this hook as well. Advice is written about the main
             // agent's work and is only actionable in the main agent's context: injected into a
@@ -954,6 +1494,31 @@ const session = await joinSession({
             }
             debug(`delivering ${advice.severity} as context: ${advice.note}`);
             recordAdvice(advice.severity, advice.note, `injected before: ${input?.toolName}`);
+            return { additionalContext: formatAdvice(advice) };
+        },
+
+        // Delivery on the *next* tool call is the problem this hook exists to narrow. A review
+        // runs while the agent works, so its verdict routinely lands during a long tool call —
+        // and under autopilot the agent often makes no further call after it, so the advice fell
+        // through to `onAgentStop` and reached the user as a queued message attributed to them,
+        // by which time the work was finished. Firing here delivers the same advice within the
+        // same turn, as hook guidance attributed to the advisor rather than to the user.
+        //
+        // Deliberately does not carry blockers. This hook runs after the tool has already
+        // executed, so it has no `permissionDecision` to withhold — consuming a blocker here
+        // would spend it as an ordinary note and silently retire the denial that `blockOnBlocker`
+        // promises. Blockers therefore keep exactly their existing path: denied at the next
+        // `onPreToolUse`, or held to `onAgentStop`.
+        //
+        // Exactly-once delivery across all three hooks is not enforced here but by
+        // `takePendingAdvice`, which reads and clears in one synchronous step with no `await`
+        // between, so whichever hook calls first takes the advice and any other gets null.
+        onPostToolUse: async (input) => {
+            const advice = await takeAdviceForPostToolUse(input);
+            if (!advice) return;
+
+            debug(`delivering ${advice.severity} as context after: ${input?.toolName}`);
+            recordAdvice(advice.severity, advice.note, `injected after: ${input?.toolName}`);
             return { additionalContext: formatAdvice(advice) };
         },
 
@@ -1003,9 +1568,23 @@ const session = await joinSession({
 
             debug(`blocking agent stop on pending blocker: ${advice.note}`);
             recordAdvice(advice.severity, advice.note, "blocked agent stop");
-            // Enqueued as a user message by the runtime, so the framing in formatAdvice — an
-            // independent reviewer that may be wrong — is what stops it reading as the user's
-            // own instruction.
+            // KNOWN LIMITATION, deliberately accepted. The host re-delivers this `reason` into the
+            // session as a `user.message` — verbatim, with `delivery: "queued"` — so the agent
+            // receives the advisor's words attributed to the user. `AgentStopHookOutput` accepts
+            // only `decision` and `reason`: it has no `additionalContext`, which is how every
+            // other hook delivers correctly-attributed guidance, and `session.send` offers no
+            // source or attribution option either. There is therefore no supported way to reach
+            // an agent at its stop boundary without a synthetic user turn.
+            //
+            // Asaf chose to keep the block rather than lose end-of-turn enforcement, so the
+            // mitigation is framing: `formatAdvice` opens with an `<advisor>` element naming an
+            // independent reviewer that may be wrong, which is what stops it reading as the
+            // user's own instruction. `classifyPrompt` recognises that same element when the
+            // message arrives back, so the advisor never treats it as evidence the user said it.
+            //
+            // The narrower fix is `onPostToolUse`, which delivers in-turn and correctly
+            // attributed; this path only runs for advice that arrives with no tool call left to
+            // carry it. Drop the block once a stop hook can return `additionalContext`.
             return { decision: "block", reason: formatAdvice(advice) };
         },
     },
@@ -1015,22 +1594,7 @@ const session = await joinSession({
             name: "advisor",
             description: "Show advisor status",
             handler: async () => {
-                const lines = [
-                    `enabled:        ${cfg("enabled")}`,
-                    `model:          ${cfg("model")} (${cfg("agentType")})`,
-                    `cadence:        every ${cfg("everyNToolCalls")} tool calls (currently ${currentInterval()}, immune for first ${cfg("immuneToolCalls")})`,
-                    `block on:       ${cfg("blockOnBlocker") ? "blocker" : "nothing"}`,
-                    `config:         ${config._configPath ?? "built-in defaults"}`,
-                    `advice log:     ${sessionScopedPath(cfg("adviceLog")) ?? "disabled"}`,
-                    `checks run:     ${state.checksRun}`,
-                    `advice given:   ${state.adviceDelivered}`,
-                    `tool calls:     ${state.toolCallsSinceCheck}/${currentInterval()} since last check`,
-                    `quiet streak:   ${state.consecutiveQuietChecks}`,
-                    `in flight:      ${state.checkInFlight}`,
-                    `pending advice: ${state.pendingAdvice ? state.pendingAdvice.severity : "none"}`,
-                    `last error:     ${state.lastError ?? "none"}`,
-                ];
-                await report(`advisor status\n${lines.join("\n")}`);
+                await report(`advisor status\n${formatStatus(controlStatus())}`);
             },
         },
         {
@@ -1046,8 +1610,7 @@ const session = await joinSession({
             name: "advisor-on",
             description: "Enable the advisor for this session",
             handler: async () => {
-                state.sessionOverrides.enabled = true;
-                state.lastReportedError = null;
+                controlSetEnabled(true);
                 await report("advisor: enabled");
             },
         },
@@ -1055,8 +1618,7 @@ const session = await joinSession({
             name: "advisor-off",
             description: "Disable the advisor for this session",
             handler: async () => {
-                state.sessionOverrides.enabled = false;
-                state.pendingAdvice = null;
+                controlSetEnabled(false);
                 await report("advisor: disabled");
             },
         },
@@ -1064,75 +1626,34 @@ const session = await joinSession({
             name: "advisor-model",
             description: "Set the advisor model for this session, e.g. /advisor-model gpt-5.6-terra",
             handler: async (ctx) => {
-                const model = ctx.args?.trim();
-                if (!model) {
-                    await report(`advisor model: ${cfg("model")}`);
-                    return;
-                }
-                state.sessionOverrides.model = model;
-                await report(`advisor model set to ${model}`);
+                const result = controlSetModel(ctx.args?.trim());
+                await report(result.changed ? `advisor model set to ${result.model}` : `advisor model: ${result.model}`);
             },
         },
         {
             name: "advisor-every",
             description: "Set how many tool calls between advisor reviews, e.g. /advisor-every 20",
             handler: async (ctx) => {
-                const n = Number.parseInt(ctx.args?.trim(), 10);
-                if (!Number.isFinite(n) || n < 1) {
-                    await report(`advisor cadence: every ${cfg("everyNToolCalls")} tool calls`);
-                    return;
-                }
-                state.sessionOverrides.everyNToolCalls = n;
-                await report(`advisor will review every ${n} tool calls`);
+                const result = controlSetCadence(Number.parseInt(ctx.args?.trim(), 10));
+                await report(
+                    result.changed
+                        ? `advisor will review every ${result.everyNToolCalls} tool calls`
+                        : `advisor cadence: every ${result.everyNToolCalls} tool calls`,
+                );
             },
         },
         {
             name: "advisor-log",
             description: "Show recent advisor advice for this session, e.g. /advisor-log 10",
             handler: async (ctx) => {
-                const path = sessionScopedPath(cfg("adviceLog"));
-                if (!path) {
-                    await report("advisor: adviceLog is disabled in config");
-                    return;
-                }
-                if (!existsSync(path)) {
-                    await report(`advisor: no advice recorded yet this session\n${path}`);
-                    return;
-                }
-
-                const requested = Number.parseInt(ctx.args?.trim(), 10);
-                const count = Number.isFinite(requested) && requested > 0 ? requested : 5;
-
-                let entries;
-                try {
-                    entries = readFileSync(path, "utf8")
-                        .split(ADVICE_ENTRY_SEPARATOR)
-                        .map((e) => e.trim())
-                        .filter(Boolean);
-                } catch (err) {
-                    await report(`advisor: could not read ${path}\n${err?.message ?? err}`);
-                    return;
-                }
-
-                if (entries.length === 0) {
-                    await report(`advisor: no advice recorded yet this session\n${path}`);
-                    return;
-                }
-
-                const shown = entries.slice(-count);
-                await report(
-                    `advisor — last ${shown.length} of ${entries.length} advice entries\n${path}\n\n` +
-                        shown.join("\n\n"),
-                );
+                await report(formatAdviceLog(controlReadAdvice(Number.parseInt(ctx.args?.trim(), 10))));
             },
         },
         {
             name: "advisor-reload",
             description: "Reload advisor.json config from disk",
             handler: async () => {
-                config = loadConfig(process.cwd());
-                state.sessionOverrides = {};
-                await report(`advisor config reloaded from ${config._configPath ?? "built-in defaults"}`);
+                await report(`advisor config reloaded from ${controlReloadConfig("tool").configPath ?? "built-in defaults"}`);
             },
         },
     ],
@@ -1148,6 +1669,57 @@ async function report(message) {
         // It must at least reach the debug log.
         debug(`report failed (level=${cfg("timelineLevel")}): ${err?.message ?? err}`);
     }
+}
+
+// Prompts are classified from the event rather than from `onUserPromptSubmitted`, because that
+// hook cannot tell a sub-agent's opening prompt from something the user typed: measured on host
+// 1.0.84-5, its bracket carries neither `agentId` nor `parentToolCallId`, unlike the tool-use
+// hooks'. The consequence was not merely noisy. `state.userPrompts` is the trusted record
+// `downgradeUnfoundedUserClaim` corroborates against, so a sub-agent's task prompt landing there
+// let the advisor quote text it had only ever read back to itself as the user's own words, and
+// deny the main agent's tool calls over a "user requirement" that the user never stated.
+//
+// Correlating the hook against this event was tried first and rejected: the event arrived 273 ms
+// after the hook was entered, so any bounded wait is a race that fails open under load — which is
+// precisely the failure being fixed. Handling the event directly has no such window.
+//
+// Reproduce the timing with an extension that logs `hook.start` for `userPromptSubmitted` beside
+// `user.message`, then drives a `task` sub-agent; if the hook bracket ever carries an `agentId`,
+// this can move back and get simpler.
+function handleUserMessage(event) {
+    const record = { content: event?.data?.content, agentId: event?.agentId, source: event?.data?.source };
+    const { owner, isUserAuthored, setsGoal, reason } = classifyPrompt(record);
+
+    if (owner === PROMPT_OWNER_SUB_AGENT) {
+        debug(`ignoring sub-agent prompt: ${truncate(record.content ?? "", 120)}`);
+        return;
+    }
+
+    // Everything below is turn state for the main session. A cross-session message and the
+    // host's `<advisor>` follow-up both genuinely start a turn here, so both reset it; what they
+    // do not do is speak for the user.
+    if (setsGoal && record.content) state.goal = record.content;
+
+    // Kept across turns: this is the only trusted record of what the user actually asked for, and
+    // a later "continue" must not erase an earlier requirement. Gated on authorship, not on
+    // ownership — see `classifyPrompt` for why those are different questions.
+    if (isUserAuthored && record.content) {
+        state.userPrompts.push(record.content);
+        if (state.userPrompts.length > USER_PROMPT_HISTORY_LIMIT) state.userPrompts.shift();
+    } else {
+        debug(`prompt not admitted as user evidence (${reason})`);
+    }
+
+    state.toolCallsThisTurn = 0;
+    state.toolCallsSinceCheck = 0;
+    state.pendingAdvice = null;
+    state.deferredTimelineAdvice = null;
+    // A new turn proves the user is present and any prompt they were being shown is resolved.
+    // Clearing here is what stops a missed completion event silencing the advisor for the rest of
+    // the session: the guard fails open at the next turn.
+    state.openPrompts.clear();
+    state.lastAdviceNote = "";
+    state.activeCalls.clear();
 }
 
 // Counted from the event log rather than from the tool-use hooks: those fire for sub-agent tool
@@ -1216,6 +1788,9 @@ if (config._problems?.length) {
 // only these events carry an `agentId`.
 session.on((event) => {
     switch (event?.type) {
+        case "user.message":
+            handleUserMessage(event);
+            break;
         case "hook.start":
             noteHookStart(event);
             break;
@@ -1229,6 +1804,11 @@ session.on((event) => {
             break;
         case "tool.execution_complete":
             noteCallFinished(event);
+            releaseQueuedCheck(event);
+            break;
+        case "external_tool.requested":
+            // Attribution for this extension's own tool — see `toolCallIsFromSubAgent`.
+            noteExternalToolRequested(event);
             break;
         case "user_input.requested":
         case "permission.requested":
