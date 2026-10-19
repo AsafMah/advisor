@@ -16,6 +16,8 @@ import {
     isFatalError,
     truncate,
     renderToolArgs,
+    toolNamesByCallId,
+    renderEvent,
     validateConfig,
     balancedJsonCandidates,
     parseVerdict,
@@ -740,5 +742,34 @@ test("a sub-agent prompt cannot corroborate a blocker", async (t) => {
         };
         assert.equal(downgradeUnfoundedUserClaim(advice, trusted), true);
         assert.equal(advice.severity, "concern");
+    });
+});
+
+test("a tool result is named after the call that produced it", async (t) => {
+    // Shapes as measured: `tool.execution_complete` carries the call id and no tool name.
+    const start = { type: "tool.execution_start", data: { toolCallId: "c1", toolName: "powershell", arguments: {} } };
+    const done = { type: "tool.execution_complete", data: { toolCallId: "c1", success: true, result: "exit 0" } };
+
+    await t.test("the start can sit outside the slice being rendered", () => {
+        const toolNames = toolNamesByCallId([start, done]);
+        assert.equal(renderEvent(done, { toolNames }), "TOOL_RESULT powershell [ok]: exit 0");
+    });
+
+    await t.test("an unmatched result says so rather than printing undefined", () => {
+        const line = renderEvent(done, { toolNames: new Map() });
+        assert.match(line, /^TOOL_RESULT \(unknown tool\) \[ok\]/);
+        assert.doesNotMatch(renderEvent(done), /undefined/);
+    });
+
+    await t.test("a name on the result itself wins", () => {
+        const named = { ...done, data: { ...done.data, toolName: "view" } };
+        assert.match(renderEvent(named, { toolNames: toolNamesByCallId([start]) }), /^TOOL_RESULT view /);
+    });
+
+    await t.test("failures carry the error, and the result is still truncated", () => {
+        const failed = { type: "tool.execution_complete", data: { toolCallId: "c1", success: false, error: "x".repeat(500) } };
+        const line = renderEvent(failed, { toolNames: toolNamesByCallId([start]), maxToolResultChars: 100 });
+        assert.match(line, /^TOOL_RESULT powershell \[FAILED\]: /);
+        assert.ok(line.length < 200, `expected truncation, got ${line.length} chars`);
     });
 });

@@ -73,6 +73,43 @@ export function renderToolArgs(args, limit = 600) {
     return truncate(safe, limit);
 }
 
+// `tool.execution_complete` carries the call id but no tool name (see `ToolExecutionCompleteData`
+// in the SDK's session-events.d.ts), so every result reached the advisor as
+// `TOOL_RESULT undefined`, detached from the call that produced it. The name lives on the
+// matching `tool.execution_start`, which can fall before the review's delta, so the map is built
+// from the whole log rather than from the slice being rendered.
+export function toolNamesByCallId(events) {
+    const names = new Map();
+    for (const e of events ?? []) {
+        if (e?.type !== "tool.execution_start") continue;
+        const { toolCallId, toolName } = e.data ?? {};
+        if (toolCallId && toolName) names.set(toolCallId, toolName);
+    }
+    return names;
+}
+
+export function renderEvent(event, { toolNames, maxToolResultChars = Infinity } = {}) {
+    const d = event?.data ?? {};
+    switch (event?.type) {
+        case "user.message":
+            return d.content ? `USER: ${truncate(d.content, 2000)}` : null;
+        case "assistant.message":
+            return d.content ? `AGENT: ${truncate(d.content, 2000)}` : null;
+        case "assistant.intent":
+            return d.intent ? `AGENT_INTENT: ${truncate(d.intent, 400)}` : null;
+        case "tool.execution_start":
+            return `TOOL_CALL ${d.toolName}: ${renderToolArgs(d.arguments)}`;
+        case "tool.execution_complete": {
+            const name = d.toolName ?? toolNames?.get(d.toolCallId) ?? "(unknown tool)";
+            const status = d.success === false ? "FAILED" : "ok";
+            const body = d.success === false ? d.error : d.result;
+            return `TOOL_RESULT ${name} [${status}]: ${truncate(body, maxToolResultChars)}`;
+        }
+        default:
+            return null;
+    }
+}
+
 // Minimum sane values for numeric keys. A zero or negative interval would dispatch a review on
 // every tool call or busy-loop the poller, and a bad value currently fails in confusing ways
 // rather than loudly.

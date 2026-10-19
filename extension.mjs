@@ -16,6 +16,8 @@ import {
     isFatalError,
     truncate,
     renderToolArgs,
+    renderEvent,
+    toolNamesByCallId,
     validateConfig,
     parseVerdict,
     sanitizeNote,
@@ -162,6 +164,12 @@ const state = {
     checkInFlight: false,
     pendingAdvice: null,
     pendingAdviceAt: 0,
+    // Bumped at every boundary after which a review's snapshot no longer describes what the agent
+    // is doing — see `invalidateSnapshot`.
+    epoch: 0,
+    epochReason: "",
+    // The HydraFusion turn in progress, if any — see `noteFusionResolved`.
+    fusion: null,
     lastAdviceNote: "",
     lastAdviceAt: 0,
     verdictHistory: [],
@@ -246,25 +254,41 @@ function recordAdvice(severity, note, outcome) {
     });
 }
 
-function renderEvent(event) {
-    const d = event?.data ?? {};
-    switch (event?.type) {
-        case "user.message":
-            return d.content ? `USER: ${truncate(d.content, 2000)}` : null;
-        case "assistant.message":
-            return d.content ? `AGENT: ${truncate(d.content, 2000)}` : null;
-        case "assistant.intent":
-            return d.intent ? `AGENT_INTENT: ${truncate(d.intent, 400)}` : null;
-        case "tool.execution_start":
-            return `TOOL_CALL ${d.toolName}: ${renderToolArgs(d.arguments)}`;
-        case "tool.execution_complete": {
-            const status = d.success === false ? "FAILED" : "ok";
-            const body = d.success === false ? d.error : d.result;
-            return `TOOL_RESULT ${d.toolName} [${status}]: ${truncate(body, cfg("maxToolResultChars"))}`;
-        }
-        default:
-            return null;
+// A review judges the snapshot it was given, and finishes tens of seconds later. Once the agent
+// crosses one of these boundaries — the user spoke, a new agentic loop began, a fusion committed
+// its buffered work, the turn ended — that snapshot describes a situation the agent has left, and
+// its verdict delivered now is the "stale advice" the agent then has to argue with. The commonest
+// route, measured over ten days of logs: the review agent finishing wakes the idle main agent with
+// a fresh turn, and the verdict landed on that turn's first tool call.
+//
+// Pending advice is dropped here, and a review still in flight sees the epoch move and reports its
+// verdict as undelivered instead of queueing it (`runCheck`). Nothing is lost silently: both reach
+// the advice log and the timeline.
+function invalidateSnapshot(reason) {
+    state.epoch++;
+    state.epochReason = reason;
+    const advice = state.pendingAdvice;
+    state.pendingAdvice = null;
+    if (!advice) return;
+    // The agent never saw it, so the same finding raised again is not a repeat.
+    state.lastAdviceNote = "";
+    debug(`dropping pending ${advice.severity}: ${reason}`);
+    recordAdvice(advice.severity, advice.note, `dropped, ${reason}`);
+    // Whatever `logToTimeline` says: the agent will never see this now, so only the user can.
+    // Without it, a "raised" entry is left on the timeline reading as though it was received.
+    void reportAdviceOnTimeline(advice, " · UNDELIVERED").catch(() => {});
+}
+
+// Reviews outlive the moment that triggered them, so one can finish while the agent is waiting on
+// an answer. Reporting then puts a notification over the pending question — the failure that hung
+// a session. Hold it until the user has answered; `noteUserPromptClosed` delivers it.
+async function reportAdviceOnTimeline(advice, suffix = "") {
+    if (awaitingUser()) {
+        debug(`deferring ${advice.severity} report: user input pending`);
+        state.deferredTimelineAdvice = { advice, suffix };
+        return;
     }
+    await report(formatTimelineAdvice(advice, suffix));
 }
 
 // Tool calls that have started but not finished — what the agent is doing right now. Without
@@ -324,11 +348,11 @@ function noteUserPromptClosed(event) {
 
     // A verdict withheld while the prompt was pending is still worth showing, just not over
     // the prompt. Deliver it now the user has responded rather than dropping it.
-    const advice = state.deferredTimelineAdvice;
+    const deferred = state.deferredTimelineAdvice;
     state.deferredTimelineAdvice = null;
-    if (advice) {
-        debug(`reporting ${advice.severity} deferred past the pending prompt`);
-        void report(formatTimelineAdvice(advice)).catch(() => {});
+    if (deferred) {
+        debug(`reporting ${deferred.advice.severity} deferred past the pending prompt`);
+        void report(formatTimelineAdvice(deferred.advice, deferred.suffix)).catch(() => {});
     }
 }
 
@@ -463,7 +487,11 @@ async function buildTranscriptDelta(session) {
     // Sub-agent events carry an agentId; main-agent events do not. Without this filter the
     // advisor's own verdict and its own file reads come back in the next delta rendered as things
     // the main agent said and did, and other extensions' sub-agents get mixed in too.
-    const lines = delta.filter((e) => !e?.agentId).map(renderEvent).filter(Boolean);
+    const options = { toolNames: toolNamesByCallId(events), maxToolResultChars: cfg("maxToolResultChars") };
+    const lines = delta
+        .filter((e) => !e?.agentId)
+        .map((e) => renderEvent(e, options))
+        .filter(Boolean);
     if (lines.length === 0) return null;
 
     // Keep the tail: the most recent activity is what needs reviewing.
@@ -855,8 +883,14 @@ async function runCheck(session, { force = false } = {}) {
     );
 
     try {
+        // Taken before the snapshot is read, so a boundary crossed while it is being built also
+        // counts as having outdated it.
+        const epoch = state.epoch;
         const snapshot = await buildTranscriptDelta(session);
-        if (!snapshot) return { skipped: "no new activity" };
+        if (!snapshot) {
+            debug("review skipped: no new activity");
+            return { skipped: "no new activity" };
+        }
 
         const planContext = await readPlanContext(session);
         state.checksRun++;
@@ -900,6 +934,19 @@ async function runCheck(session, { force = false } = {}) {
             return { skipped: `below minSeverityToInject (${advice.severity})` };
         }
 
+        // The agent has moved past the snapshot this verdict judged — see `invalidateSnapshot`.
+        // Shown to the user regardless of `logToTimeline`, like the idle flush: the agent will
+        // never see it, so the timeline is the only place it can land. It is still a finding, so
+        // the backoff resets; it is not delivered, so it does not arm duplicate suppression.
+        if (state.epoch !== epoch) {
+            const reason = state.epochReason;
+            state.consecutiveQuietChecks = 0;
+            debug(`verdict outlived its snapshot (${reason}): ${advice.severity}`);
+            recordAdvice(advice.severity, advice.note, `undelivered, ${reason}`);
+            await reportAdviceOnTimeline(advice, " · UNDELIVERED");
+            return { skipped: `snapshot invalidated (${reason})` };
+        }
+
         state.pendingAdvice = advice;
         state.pendingAdviceAt = Date.now();
         state.lastAdviceNote = advice.note;
@@ -908,17 +955,7 @@ async function runCheck(session, { force = false } = {}) {
         state.verdictHistory.push(`[${advice.severity}] ${truncate(advice.note, 200)}`);
         if (state.verdictHistory.length > VERDICT_HISTORY_LIMIT) state.verdictHistory.shift();
 
-        if (cfg("logToTimeline")) {
-            // Reviews outlive the moment that triggered them, so one can finish while the agent
-            // is waiting on an answer. Reporting then puts a notification over the pending
-            // question — the failure that hung a session. Hold it until the user has answered.
-            if (awaitingUser()) {
-                debug(`deferring ${advice.severity} report: user input pending`);
-                state.deferredTimelineAdvice = advice;
-            } else {
-                await report(formatTimelineAdvice(advice));
-            }
-        }
+        if (cfg("logToTimeline")) await reportAdviceOnTimeline(advice);
         recordAdvice(advice.severity, advice.note, "raised");
         return advice;
     } catch (err) {
@@ -1712,7 +1749,6 @@ function handleUserMessage(event) {
 
     state.toolCallsThisTurn = 0;
     state.toolCallsSinceCheck = 0;
-    state.pendingAdvice = null;
     state.deferredTimelineAdvice = null;
     // A new turn proves the user is present and any prompt they were being shown is resolved.
     // Clearing here is what stops a missed completion event silencing the advisor for the rest of
@@ -1720,6 +1756,66 @@ function handleUserMessage(event) {
     state.openPrompts.clear();
     state.lastAdviceNote = "";
     state.activeCalls.clear();
+    // After the prompts are cleared, or dropped advice would be deferred behind a prompt that is
+    // already resolved, and never shown.
+    invalidateSnapshot("new user message");
+}
+
+// HydraFusion runs a turn as hidden phases and then commits the chosen phase's work in one burst.
+// Measured over 34 fusion sessions: all 5068 main-agent tool calls tagged `data.fusion` arrived
+// inside a commit window, and none outside one. So until the commit there is nothing reviewable,
+// and during it the calls are a replay of finished work arriving faster than a review can answer —
+// every review fired there judged a snapshot that was stale before its verdict landed. Reviews
+// therefore pause from `fusion_resolved` until `fusion_completed`.
+//
+// These are session-level events and carry no `agentId`. `fusion_commit_started` is absent from
+// the SDK typings but was emitted exactly once by each of 171 fusions. No two fusions overlapped in
+// 179, so one slot is enough, and a new fusion resolving proves any earlier one is over.
+//
+// Fails open, because a fusion left open would silence the advisor: a user abort was observed to
+// end a fusion with a cancelled phase and no `fusion_completed`, so `abort` and idle both close it.
+// A user message must not — steering messages arrive mid-fusion, and `fusion_resolved` itself
+// arrives just before the turn's own `user.message`.
+function noteFusionResolved(event) {
+    const { fusionId, pattern } = event?.data ?? {};
+    if (event?.agentId || !fusionId) return;
+    if (state.fusion && state.fusion.id !== fusionId) endFusion(`superseded by ${fusionId}`);
+    state.fusion = { id: fusionId, pattern, committing: false, unreviewed: 0 };
+    debug(`fusion ${fusionId} (${pattern}) open: pausing reviews`);
+}
+
+function noteFusionCommitStarted(event) {
+    const fusionId = event?.data?.fusionId;
+    if (event?.agentId || !fusionId) return;
+    if (state.fusion?.id !== fusionId) {
+        endFusion(`superseded by ${fusionId}`);
+        state.fusion = { id: fusionId, pattern: null, unreviewed: 0 };
+    }
+    state.fusion.committing = true;
+    invalidateSnapshot("fusion commit");
+}
+
+function noteFusionCompleted(event) {
+    const fusionId = event?.data?.fusionId;
+    if (event?.agentId || state.fusion?.id !== fusionId) return;
+    endFusion(event.data.outcome ?? "completed");
+}
+
+function endFusion(how) {
+    const fusion = state.fusion;
+    if (!fusion) return;
+    state.fusion = null;
+    debug(`fusion ${fusion.id} ended (${how}): ${fusion.unreviewed} tool calls went unreviewed`);
+}
+
+// A turn id of "0" starts a new agentic loop. Outside a fusion commit, that is a turn the agent
+// began after the last one ended — most often woken by a background task, the advisor's own review
+// agent included, finishing. A fusion commit replays its work as loops that also restart at "0";
+// the commit has already invalidated, so those are ignored.
+function noteTurnStart(event) {
+    if (event?.agentId || String(event?.data?.turnId) !== "0") return;
+    if (state.fusion?.committing) return;
+    invalidateSnapshot("new agent turn");
 }
 
 // Counted from the event log rather than from the tool-use hooks: those fire for sub-agent tool
@@ -1730,6 +1826,11 @@ function countToolCall(event) {
     if (!cfg("enabled")) return;
     if (USER_INPUT_TOOLS.has(event?.data?.toolName)) return;
 
+    // The tag also covers a fusion whose `fusion_resolved` this process never saw.
+    if (state.fusion || event?.data?.fusion) {
+        if (state.fusion) state.fusion.unreviewed++;
+        return;
+    }
     state.toolCallsThisTurn++;
     state.toolCallsSinceCheck++;
 
@@ -1806,6 +1907,21 @@ session.on((event) => {
             noteCallFinished(event);
             releaseQueuedCheck(event);
             break;
+        case "assistant.turn_start":
+            noteTurnStart(event);
+            break;
+        case "session.fusion_resolved":
+            noteFusionResolved(event);
+            break;
+        case "session.fusion_commit_started":
+            noteFusionCommitStarted(event);
+            break;
+        case "session.fusion_completed":
+            noteFusionCompleted(event);
+            break;
+        case "abort":
+            if (!event?.agentId) endFusion(`aborted: ${event?.data?.reason ?? "no reason"}`);
+            break;
         case "external_tool.requested":
             // Attribution for this extension's own tool — see `toolCallIsFromSubAgent`.
             noteExternalToolRequested(event);
@@ -1826,15 +1942,18 @@ session.on((event) => {
 // Advice is normally delivered on the next tool call. A turn that ends without one would drop
 // it silently, so surface anything still pending when the session goes idle.
 session.on("session.idle", () => {
-    const advice = state.pendingAdvice;
-    if (!advice) return;
     // Idle while a prompt is on screen is not the end of the turn, it is the turn waiting on
     // the user. Leave the advice pending rather than announcing it over the prompt.
     if (awaitingUser()) return;
-    state.pendingAdvice = null;
-    debug(`flushing undelivered ${advice.severity} at idle: ${advice.note}`);
-    recordAdvice(advice.severity, advice.note, "undelivered, turn ended");
-    void session
-        .log(formatTimelineAdvice(advice, " · UNDELIVERED"), { level: cfg("timelineLevel") })
-        .catch(() => {});
+    endFusion("session idle");
+    const advice = state.pendingAdvice;
+    if (advice) {
+        state.pendingAdvice = null;
+        debug(`flushing undelivered ${advice.severity} at idle: ${advice.note}`);
+        recordAdvice(advice.severity, advice.note, "undelivered, turn ended");
+        void session
+            .log(formatTimelineAdvice(advice, " · UNDELIVERED"), { level: cfg("timelineLevel") })
+            .catch(() => {});
+    }
+    invalidateSnapshot("turn ended");
 });
