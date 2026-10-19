@@ -82,6 +82,21 @@ So a blocker is a loud, disruptive way to make the agent stop and read a note. I
 Advice older than `maxAdviceAgeMs` is discarded rather than delivered, which limits the damage
 but does not make delivery causally aligned with the reviewed action.
 
+Age is a weak proxy for staleness, though: a verdict that lands two seconds after the user changed
+direction is as stale as one that is ten minutes old. So advice is also tied to the snapshot it
+judged, and invalidated when the agent crosses a boundary that snapshot cannot describe:
+
+- a new user message, including a steering message mid-turn;
+- a new agentic loop (`assistant.turn_start` with turn id `0`) — which is also how an idle agent
+  is woken when a background task finishes, the advisor's own review included;
+- a HydraFusion commit (see [HydraFusion turns are not reviewed](#hydrafusion-turns-are-not-reviewed));
+- the turn ending.
+
+Advice still pending at a boundary is dropped, and a verdict that lands after one is never
+delivered to the agent. Either way it is shown on the timeline as `UNDELIVERED`, whatever
+`logToTimeline` says, because the timeline is then the only place it can reach. Both outcomes are
+in the advice log.
+
 One gap this leaves: an agent that stops working makes no next tool call, so a blocker found at
 the end of a turn used to be written to the timeline as `UNDELIVERED` and never acted on. A
 pending blocker now also holds the turn open via the agent-stop hook, which enqueues it as a
@@ -318,6 +333,31 @@ instead by the next user turn, which is positive evidence the user is back and t
 they were shown is moot. That keeps a dropped `.completed` event from silencing the advisor for
 the rest of the session.
 
+## HydraFusion turns are not reviewed
+
+A HydraFusion turn (the `hydrafusion` models) runs as hidden phases, then commits the chosen
+phase's work in one burst. Measured over 34 sessions, every main-agent tool call tagged with
+`data.fusion` — 5068 of them — arrived inside a commit window, and none outside one. So until the
+commit there is nothing to review, and during it the calls are a replay of finished work arriving
+faster than any review can answer: every review fired there judged a snapshot that was stale
+before its verdict landed.
+
+Reviews therefore pause from `session.fusion_resolved` until `session.fusion_completed`, and a
+call tagged `data.fusion` is never counted even if the fusion's start was missed. The commit
+itself invalidates pending advice; the commit's own agentic loops, which restart at turn id `0`,
+do not invalidate it a second time.
+
+The pause fails open, because a fusion left open would silence the advisor. A user abort was
+observed ending a fusion with a cancelled phase and no `fusion_completed`, so an `abort`, the
+session going idle, or the next fusion resolving all close it — no two fusions were ever seen to
+overlap. A user message does not close it: steering messages arrive mid-fusion, and
+`fusion_resolved` arrives just *before* the turn's own `user.message`.
+
+`session.fusion_commit_started` is absent from the SDK's typings, but every one of 171 fusions
+observed emitted it exactly once. If it stops being emitted, the commit's loops are no longer
+recognised as a replay: each one that restarts at turn id `0` invalidates advice as a new agent
+turn, and `fusion_completed` alone ends the pause.
+
 ## Cadence and backoff
 
 Reviews are expensive and most find nothing, so the interval doubles after each quiet review —
@@ -335,7 +375,8 @@ Advice is delivered into the agent's context, where you cannot see it. Two thing
   deliberately does not default to `error`: see
   [Advice is not a session failure](#advice-is-not-a-session-failure).
 - **The advice log.** A human-readable record of every outcome: raised, injected, denied, dropped
-  as stale, or undelivered. Read it with `/advisor-log`, or tail the path printed at startup. Each
+  as stale or at a boundary, or undelivered — a boundary outcome names its boundary, such as
+  `dropped, new agent turn`. Read it with `/advisor-log`, or tail the path printed at startup. Each
   entry is stamped with an ISO instant; `/advisor-log` renders that as a local date and time, and
   labels an older, undated entry rather than guessing a date for it.
 
@@ -558,14 +599,15 @@ JSON but not a verdict must not be accepted.
   verdict, because an empty verdict reads as "no concerns" — which both hides the failure and,
   by counting as a quiet review, widens the backoff so reviews become rarer. Errors surface once
   per distinct message; failures that cannot succeed on retry disable the advisor and say so.
-- **Emission guard.** One piece of advice per review; no new review starts while one is in flight
-  or while advice is still pending. Identical advice is suppressed for five minutes, but never
-  for a `blocker`, so a genuine repeat of the same mistake is not silenced.
+- **Emission guard.** One piece of advice per review; no new review starts while one is in flight,
+  while advice is still pending, or while a HydraFusion turn is open. Identical advice is
+  suppressed for five minutes, but never for a `blocker`, so a genuine repeat of the same mistake
+  is not silenced — and advice dropped before the agent saw it does not count as given.
 - **Incremental transcript.** Each review sees only what happened since the previous one, plus
   the user's original goal.
 - **Advice is never silently lost.** Delivery normally happens on the next tool call, but a turn
   that ends without one would drop it, so anything still pending is flushed to the timeline on
-  `session.idle`.
+  `session.idle`. A verdict that outlives its snapshot is shown there as `UNDELIVERED` too.
 - **Transcripts are sent unredacted.** Tool results reach the advisor as-is, including anything
   sensitive that appeared in their output. This is deliberate: the advisor is an ordinary
   sub-agent of the same session, running on the same provider under the same trust boundary, so
@@ -593,7 +635,13 @@ JSON but not a verdict must not be accepted.
   override via `rpc.tools.updateSubagentSettings`, both of which also affect any `rubber-duck`
   agent you dispatch yourself.
 - Every review emits an "agent finished" system notification into the main agent's context.
-  This is runtime behaviour for background agents and cannot currently be suppressed.
+  This is runtime behaviour for background agents and cannot currently be suppressed. When the
+  main agent has already stopped, that notification wakes it into a new turn; the review's verdict
+  is then shown as `UNDELIVERED` rather than handed to the woken agent, but the wake itself still
+  happens.
+- HydraFusion turns get no reviews at all — see
+  [HydraFusion turns are not reviewed](#hydrafusion-turns-are-not-reviewed). The next review after
+  one sees the committed work as recent activity, cut to its last `maxTranscriptChars`.
 - An agent that stops calling tools and answers directly will not be reviewed before it replies.
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.
