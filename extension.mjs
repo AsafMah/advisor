@@ -16,6 +16,8 @@ import {
     isFatalError,
     truncate,
     renderToolArgs,
+    renderEvent,
+    toolNamesByCallId,
     validateConfig,
     parseVerdict,
     sanitizeNote,
@@ -246,27 +248,6 @@ function recordAdvice(severity, note, outcome) {
     });
 }
 
-function renderEvent(event) {
-    const d = event?.data ?? {};
-    switch (event?.type) {
-        case "user.message":
-            return d.content ? `USER: ${truncate(d.content, 2000)}` : null;
-        case "assistant.message":
-            return d.content ? `AGENT: ${truncate(d.content, 2000)}` : null;
-        case "assistant.intent":
-            return d.intent ? `AGENT_INTENT: ${truncate(d.intent, 400)}` : null;
-        case "tool.execution_start":
-            return `TOOL_CALL ${d.toolName}: ${renderToolArgs(d.arguments)}`;
-        case "tool.execution_complete": {
-            const status = d.success === false ? "FAILED" : "ok";
-            const body = d.success === false ? d.error : d.result;
-            return `TOOL_RESULT ${d.toolName} [${status}]: ${truncate(body, cfg("maxToolResultChars"))}`;
-        }
-        default:
-            return null;
-    }
-}
-
 // Tool calls that have started but not finished — what the agent is doing right now. Without
 // these the advisor only ever sees the past and can react to a mistake but never prevent one.
 //
@@ -463,7 +444,11 @@ async function buildTranscriptDelta(session) {
     // Sub-agent events carry an agentId; main-agent events do not. Without this filter the
     // advisor's own verdict and its own file reads come back in the next delta rendered as things
     // the main agent said and did, and other extensions' sub-agents get mixed in too.
-    const lines = delta.filter((e) => !e?.agentId).map(renderEvent).filter(Boolean);
+    const options = { toolNames: toolNamesByCallId(events), maxToolResultChars: cfg("maxToolResultChars") };
+    const lines = delta
+        .filter((e) => !e?.agentId)
+        .map((e) => renderEvent(e, options))
+        .filter(Boolean);
     if (lines.length === 0) return null;
 
     // Keep the tail: the most recent activity is what needs reviewing.

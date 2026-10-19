@@ -206,3 +206,19 @@ test("advice that has gone stale is dropped rather than delivered late", async (
     assert.equal(await host.postToolUse(edit), undefined);
     assert.match(await host.status(), /pending advice: none/);
 });
+
+test("a review is shown each tool result under its tool's name", async () => {
+    const host = await bootExtension();
+    host.emit({
+        type: "tool.execution_start",
+        data: { toolCallId: "named-1", toolName: "powershell", arguments: { command: "npm test" } },
+    });
+    host.emit({
+        type: "tool.execution_complete",
+        data: { toolCallId: "named-1", success: true, result: "41 passing" },
+    });
+    await host.runCheck({ severity: "none", note: "" });
+    const prompt = host.startedAgents[0].prompt;
+    assert.match(prompt, /TOOL_RESULT powershell \[ok\]: 41 passing/);
+    assert.doesNotMatch(prompt, /TOOL_RESULT undefined/);
+});
