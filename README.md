@@ -561,7 +561,19 @@ JSON but not a verdict must not be accepted.
   `classifyPrompt` recognises that element on the way back in, so the advisor never treats its own
   returned text as evidence of what the user wants. Remove the block when a stop hook can return
   `additionalContext`.
-- **Reply recovery.** The reply is read in order of reliability: `task.result`, then
+- **Silent reviews.** The host announces every finished sub-agent to the main agent unless its
+  task is cancelled first. The review agent's stop reaches `onSubagentStop` with its final reply,
+  and when the stop carries the exact agent id `startAgent` returned, the hook cancels that task
+  and hands the reply to the review. Cancelling there, while the host still awaits the hook, is
+  what keeps the "agent finished" notification out of the main agent's context: measured on
+  1.0.99-2, no notification in 4 of 4 runs, whereas returning `modifiedResponse` does not
+  suppress it. The hook never returns anything — `block` would keep the agent running and
+  `modifiedResponse` would rewrite a reply — and ignores every stop that is not the advisor's own,
+  since cancelling one would kill the user's sub-agent. When the stop's reply is blank or not a
+  verdict (an agent can follow its verdict with a remark), the latest parseable reply in the
+  event log is used instead.
+- **Reply recovery.** Without the hook (an older host), or before it fires, the reply is read in
+  order of reliability: `task.result`, then
   `task.latestResponse`, then the session event log. The first two are keyed by the task id the
   extension owns, so they cannot bind to a foreign agent. The event-log fallback exists because
   `tasks.list()` can report the sub-agent as `idle` while leaving `result` null indefinitely; it
@@ -634,11 +646,11 @@ JSON but not a verdict must not be accepted.
   remaining levers are `subagents.agents["rubber-duck"].effortLevel` in `settings.json` or a live
   override via `rpc.tools.updateSubagentSettings`, both of which also affect any `rubber-duck`
   agent you dispatch yourself.
-- Every review emits an "agent finished" system notification into the main agent's context.
-  This is runtime behaviour for background agents and cannot currently be suppressed. When the
+- A review can still emit an "agent finished" system notification into the main agent's context
+  when the cancel in `onSubagentStop` does not take, or on a host without that hook. When the
   main agent has already stopped, that notification wakes it into a new turn; the review's verdict
   is then shown as `UNDELIVERED` rather than handed to the woken agent, but the wake itself still
-  happens.
+  happens. See [Silent reviews](#design-notes).
 - HydraFusion turns get no reviews at all — see
   [HydraFusion turns are not reviewed](#hydrafusion-turns-are-not-reviewed). The next review after
   one sees the committed work as recent activity, cut to its last `maxTranscriptChars`.

@@ -373,3 +373,65 @@ export function classifyPrompt(record) {
     }
     return { owner: PROMPT_OWNER_MAIN, isUserAuthored: true, setsGoal: true, reason: "user" };
 }
+
+// The host announces a finished sub-agent to the main agent unless the task is cancelled first,
+// and polling for the reply can only race that announcement. `onSubagentStop` is the one point
+// where the race is decided in advisor's favour. Measured on 1.0.99-2: a cancel of the exact agent,
+// awaited inside the hook, produced no notification in 4 of 4 runs, whereas `modifiedResponse`
+// does not suppress it.
+//
+// One capture describes one review. `start` records the agent id once `startAgent` returns —
+// the stop can arrive before that, so a stop waits briefly for it — and `settle` hands the
+// captured reply to the polling loop.
+export function createReviewCapture() {
+    let resolveStarted;
+    let resolveSettled;
+    const capture = {
+        agentId: null,
+        claimed: false,
+        done: false,
+        started: new Promise((resolve) => (resolveStarted = resolve)),
+        settled: new Promise((resolve) => (resolveSettled = resolve)),
+        start(id) {
+            if (capture.agentId === null && typeof id === "string" && id) capture.agentId = id;
+            resolveStarted(capture.agentId);
+        },
+        settle(value) {
+            resolveSettled(value);
+        },
+    };
+    return capture;
+}
+
+function waitBounded(promise, ms) {
+    let timer;
+    const timeout = new Promise((resolve) => (timer = setTimeout(() => resolve(null), ms)));
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Ownership is the exact agent id `startAgent` returned, never a prompt or model match: cancelling
+// a stop that is not advisor's would kill the user's own sub-agent. The cancel is awaited before
+// settling so the review cannot return — and dispose the task — while the cancel is in flight.
+// A failed cancel is still settled: the reply is valid either way, and only the notification is lost.
+export async function captureOwnedStop(capture, input, { cancel, startWaitMs = 0 } = {}) {
+    const notOwned = { owned: false };
+    const id = input?.agentId;
+    if (!capture || capture.done || capture.claimed) return notOwned;
+    if (typeof id !== "string" || id === "") return notOwned;
+
+    if (capture.agentId === null) await waitBounded(capture.started, startWaitMs);
+    if (capture.agentId !== id || capture.done || capture.claimed) return notOwned;
+
+    capture.claimed = true;
+    const response = typeof input.response === "string" ? input.response : "";
+    let cancelled = false;
+    let cancelError = null;
+    try {
+        cancelled = (await cancel(id))?.cancelled === true;
+    } catch (err) {
+        cancelError = err?.message ?? String(err);
+    }
+    const outcome = { response, cancelled, cancelError };
+    capture.settle(outcome);
+    return { owned: true, ...outcome };
+}

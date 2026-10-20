@@ -27,6 +27,8 @@ import {
     downgradeUnfoundedUserClaim,
     classifyPrompt,
     PROMPT_OWNER_SUB_AGENT,
+    createReviewCapture,
+    captureOwnedStop,
 } from "./lib.mjs";
 
 // The activity panel — the ring the canvas renders, and the loopback server it talks to. Kept in
@@ -125,6 +127,11 @@ const USER_PROMPT_HISTORY_LIMIT = 40;
 // Upper bound on cancelling and removing a finished review task.
 const DISPOSE_TIMEOUT_MS = 5000;
 
+// How long a sub-agent stop that arrives while `startAgent` is still in flight waits to learn
+// whether it is the review's. It only waits that long if `startAgent` itself takes that long, and
+// a stop that is not the review's is held up by no more than this.
+const STOP_START_WAIT_MS = 2000;
+
 function loadConfig(workingDirectory) {
     const candidates = [
         process.env.COPILOT_ADVISOR_CONFIG,
@@ -179,6 +186,9 @@ const state = {
     deferredTimelineAdvice: null,
     checksRun: 0,
     staleTaskId: null,
+    // The review agent currently running, for `onSubagentStop` to recognise — see
+    // `captureOwnedStop`.
+    ownedReview: null,
     adviceDelivered: 0,
     lastError: null,
     lastReportedError: null,
@@ -632,13 +642,26 @@ async function runAdvisorAgent(session, prompt) {
     // startAgent RPC has no effort parameter, so a dedicated custom agent is the only way to
     // pin the advisor's reasoning level.
     const modelOverride = cfg("model");
-    const { agentId } = await rpc.tasks.startAgent({
-        agentType: cfg("agentType"),
-        prompt,
-        name: "advisor",
-        description: ADVISOR_TASK_DESCRIPTION,
-        ...(modelOverride ? { model: modelOverride } : {}),
-    });
+    // Published before the agent exists: its stop can reach `onSubagentStop` before `startAgent`
+    // resolves, and `captureOwnedStop` waits for `start` rather than dropping it.
+    const capture = createReviewCapture();
+    capture.rpc = rpc;
+    state.ownedReview = capture;
+    let agentId;
+    try {
+        ({ agentId } = await rpc.tasks.startAgent({
+            agentType: cfg("agentType"),
+            prompt,
+            name: "advisor",
+            description: ADVISOR_TASK_DESCRIPTION,
+            ...(modelOverride ? { model: modelOverride } : {}),
+        }));
+    } catch (err) {
+        capture.start(null);
+        releaseCapture(capture);
+        throw err;
+    }
+    capture.start(agentId);
     debug(
         `started advisor agent ${agentId} as ${cfg("agentType")}` +
             ` on ${modelOverride ?? "agent-defined model"} (event baseline ${baseline})`,
@@ -647,14 +670,45 @@ async function runAdvisorAgent(session, prompt) {
     const deadline = Date.now() + cfg("timeoutMs");
     let seen = false;
     let emptySettledPolls = 0;
+    let lastToolCallId = null;
     // Once the sub-agent has reached `subagent.completed` the CLI has already emitted its "agent
     // has finished" notification, so the task has to survive long enough for a `read_agent` that
     // follows it. Tracked here so the cleanup below knows which case it is in.
     let completedBeforeReply = false;
 
+    // The stop hook's reply is authoritative once it has claimed the review: by then the agent
+    // has finished and the hook has already cancelled it, so polling further could only observe
+    // that cancellation and misreport it as a failure.
+    const replyFromStop = async () => {
+        const { response, cancelled, cancelError } = await capture.settled;
+        if (!cancelled) {
+            // The notification has probably gone out, so leave the task for its `read_agent`.
+            completedBeforeReply = true;
+            debug(
+                `stop-hook cancel of ${agentId} did not take` +
+                    `${cancelError ? ` (${cancelError})` : ""}; keeping it readable`,
+            );
+        }
+        let reply = response;
+        // The hook carries only the agent's last message, and an agent can follow its verdict
+        // with a remark. The event log holds every message, so take the latest that parses —
+        // which is what the poll below would have acted on had it seen the verdict first.
+        if (!reply.trim() || parseVerdict(reply).unparseable) {
+            const toolCallId = lastToolCallId ?? (await findTaskToolCallId(rpc, agentId));
+            const { replies } = await readAgentReplyFromEventLog(session, toolCallId, baseline);
+            const verdict = replies.findLast((r) => !parseVerdict(r).unparseable);
+            if (verdict) reply = verdict;
+        }
+        // A blank reply parses as a clean "none", which would pass off a review that said nothing.
+        if (!reply.trim()) throw new Error("advisor agent stopped without a reply");
+        debug(`reply via stop hook${cancelled ? "; cancelled before completion" : ""}`);
+        return reply;
+    };
+
     try {
         while (Date.now() < deadline) {
-            await new Promise((r) => setTimeout(r, cfg("pollIntervalMs")));
+            await sleepUnlessSettled(cfg("pollIntervalMs"), capture.settled);
+            if (capture.claimed) return await replyFromStop();
 
             let tasks = [];
             try {
@@ -662,6 +716,9 @@ async function runAdvisorAgent(session, prompt) {
             } catch (err) {
                 throw new Error(`tasks.list failed: ${err?.message ?? err}`);
             }
+            // A claim always precedes the hook's cancel, so checking after the list returns is
+            // enough to keep that cancel from being read below as the agent being cancelled.
+            if (capture.claimed) return await replyFromStop();
 
             const task = tasks.find((t) => t.id === agentId);
             if (!task) {
@@ -670,6 +727,7 @@ async function runAdvisorAgent(session, prompt) {
                 continue;
             }
             seen = true;
+            lastToolCallId = task.toolCallId ?? lastToolCallId;
             debug(
                 `poll ${agentId}: status=${task.status} resultLen=${task.result?.length ?? "null"}` +
                     ` toolCallId=${task.toolCallId ?? "null"}`,
@@ -754,10 +812,34 @@ async function runAdvisorAgent(session, prompt) {
                 emptySettledPolls = 0;
             }
         }
+        if (capture.claimed) return await replyFromStop();
         throw new Error(`advisor agent timed out after ${cfg("timeoutMs")}ms`);
     } finally {
+        releaseCapture(capture);
         // The agent parks idle and would otherwise accumulate in the task list forever.
         await disposeTask(rpc, agentId, { keepReadable: completedBeforeReply });
+    }
+}
+
+// Retired before disposal so a stop arriving now is left alone; the dispose cancels the agent
+// regardless.
+function releaseCapture(capture) {
+    capture.done = true;
+    if (state.ownedReview === capture) state.ownedReview = null;
+}
+
+function sleepUnlessSettled(ms, settled) {
+    let timer;
+    const sleep = new Promise((resolve) => (timer = setTimeout(resolve, ms)));
+    return Promise.race([sleep, settled]).finally(() => clearTimeout(timer));
+}
+
+async function findTaskToolCallId(rpc, agentId) {
+    try {
+        const { tasks } = await rpc.tasks.list();
+        return tasks.find((t) => t.id === agentId)?.toolCallId ?? null;
+    } catch {
+        return null;
     }
 }
 
@@ -776,7 +858,7 @@ async function runAdvisorAgent(session, prompt) {
 // readable, which is well before the agent finishes, and the caller needs to know which of the two
 // it has in order to decide whether cancelling can still suppress the completion notification.
 async function readAgentReplyFromEventLog(session, toolCallId, baseline) {
-    const pending = { status: "pending", reply: "", completed: false };
+    const pending = { status: "pending", reply: "", completed: false, replies: [] };
     if (!toolCallId) return pending;
 
     let events = [];
@@ -802,6 +884,7 @@ async function readAgentReplyFromEventLog(session, toolCallId, baseline) {
             status: "failed",
             reply: failed?.data?.error ?? "sub-agent failed",
             completed: true,
+            replies: [],
         };
     }
 
@@ -816,11 +899,11 @@ async function readAgentReplyFromEventLog(session, toolCallId, baseline) {
     // as a clean "none", so treating it as an answer would silently pass off an unfinished review
     // as a verdict.
     if (replies.length === 0) {
-        return completed ? { status: "done", reply: "", completed } : pending;
+        return completed ? { status: "done", reply: "", completed, replies } : pending;
     }
 
     debug(`recovered reply for ${internalId} from event log (${replies.length} message(s))`);
-    return { status: "done", reply: replies[replies.length - 1], completed };
+    return { status: "done", reply: replies[replies.length - 1], completed, replies };
 }
 
 // Emitted once when a review yields nothing, so an unexpected event shape can be diagnosed
@@ -842,8 +925,12 @@ async function dumpEventDiagnostics(session, baseline) {
 }
 
 // Bounded: an unresolved cancel would hold `checkInFlight` true forever and stop all reviews.
-const boundedTaskCall = (promise) =>
-    Promise.race([promise, new Promise((resolve) => setTimeout(resolve, DISPOSE_TIMEOUT_MS))]);
+// `onTimeout` is what a call that never settled resolves to.
+const boundedTaskCall = (promise, onTimeout = undefined) =>
+    Promise.race([
+        promise,
+        new Promise((resolve) => setTimeout(() => resolve(onTimeout), DISPOSE_TIMEOUT_MS)),
+    ]);
 
 async function cancelTask(rpc, agentId) {
     try {
@@ -1623,6 +1710,38 @@ const session = await joinSession({
             // attributed; this path only runs for advice that arrives with no tool call left to
             // carry it. Drop the block once a stop hook can return `additionalContext`.
             return { decision: "block", reason: formatAdvice(advice) };
+        },
+
+        // Only the review agent's own stop is acted on, and only to cancel it: cancelling here is
+        // what keeps its "agent has finished" notification from reaching the main agent — see
+        // `captureOwnedStop`. Nothing is ever returned, because both outputs change what happens
+        // next: `block` keeps the agent running and `modifiedResponse` rewrites a reply that may
+        // not be advisor's. A host without this hook falls back to the polling in
+        // `runAdvisorAgent`, which is how every earlier release worked.
+        onSubagentStop: async (input) => {
+            try {
+                const capture = state.ownedReview;
+                const result = await captureOwnedStop(capture, input, {
+                    startWaitMs: STOP_START_WAIT_MS,
+                    cancel: async (id) => {
+                        const timedOut = Symbol("timed out");
+                        const result = await boundedTaskCall(capture.rpc.tasks.cancel({ id }), timedOut);
+                        if (result === timedOut) {
+                            throw new Error(`cancel timed out after ${DISPOSE_TIMEOUT_MS}ms`);
+                        }
+                        return result;
+                    },
+                });
+                if (result.owned) {
+                    debug(
+                        `review agent ${input.agentId} stopped: cancelled=${result.cancelled}` +
+                            `${result.cancelError ? ` (${result.cancelError})` : ""}` +
+                            ` replyLen=${result.response.length}`,
+                    );
+                }
+            } catch (err) {
+                debug(`onSubagentStop failed: ${err?.message ?? err}`);
+            }
         },
     },
 

@@ -31,6 +31,8 @@ import {
     isAdvisorFollowUp,
     PROMPT_OWNER_MAIN,
     PROMPT_OWNER_SUB_AGENT,
+    createReviewCapture,
+    captureOwnedStop,
 } from "./lib.mjs";
 
 const fence = "```";
@@ -771,5 +773,137 @@ test("a tool result is named after the call that produced it", async (t) => {
         const line = renderEvent(failed, { toolNames: toolNamesByCallId([start]), maxToolResultChars: 100 });
         assert.match(line, /^TOOL_RESULT powershell \[FAILED\]: /);
         assert.ok(line.length < 200, `expected truncation, got ${line.length} chars`);
+    });
+});
+
+// The stop hook is the only point at which cancelling the review agent is guaranteed to beat its
+// completion notification, so ownership and ordering are what these pin down.
+test("captureOwnedStop", async (t) => {
+    const stop = (agentId, response = '{"severity":"none"}') => ({ agentId, agentType: "rubber-duck", stopReason: "end_turn", response });
+    const recordingCancel = (result = { cancelled: true }) => {
+        const calls = [];
+        const cancel = async (id) => {
+            calls.push(id);
+            return result;
+        };
+        return { calls, cancel };
+    };
+
+    await t.test("another agent's stop is ignored and never cancelled", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { calls, cancel } = recordingCancel();
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-theirs"), { cancel }), { owned: false });
+        assert.deepEqual(calls, []);
+        assert.equal(capture.claimed, false);
+    });
+
+    await t.test("a stop without an agent id, or with no review running, is ignored", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { calls, cancel } = recordingCancel();
+        assert.deepEqual(await captureOwnedStop(capture, stop(undefined), { cancel }), { owned: false });
+        assert.deepEqual(await captureOwnedStop(null, stop("bg-mine"), { cancel }), { owned: false });
+        assert.deepEqual(calls, []);
+    });
+
+    await t.test("the owned stop is cancelled before the review is settled", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        let releaseCancel;
+        const order = [];
+        const cancel = (id) =>
+            new Promise((resolve) => {
+                order.push(`cancel ${id}`);
+                releaseCancel = () => resolve({ cancelled: true });
+            });
+        void capture.settled.then(() => order.push("settled"));
+
+        const pending = captureOwnedStop(capture, stop("bg-mine", "VERDICT"), { cancel });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.deepEqual(order, ["cancel bg-mine"], "settled before the cancel returned");
+        assert.equal(capture.claimed, true);
+
+        releaseCancel();
+        const result = await pending;
+        assert.deepEqual(result, { owned: true, response: "VERDICT", cancelled: true, cancelError: null });
+        assert.deepEqual(await capture.settled, { response: "VERDICT", cancelled: true, cancelError: null });
+        assert.deepEqual(order, ["cancel bg-mine", "settled"]);
+    });
+
+    await t.test("a cancel that did not take is reported, not assumed", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { cancel } = recordingCancel({ cancelled: false });
+        const result = await captureOwnedStop(capture, stop("bg-mine"), { cancel });
+        assert.equal(result.cancelled, false);
+        assert.equal((await capture.settled).cancelled, false);
+    });
+
+    await t.test("a cancel that throws is recorded and still settles the review", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const cancel = async () => {
+            throw new Error("cancel timed out");
+        };
+        const result = await captureOwnedStop(capture, stop("bg-mine", "VERDICT"), { cancel });
+        assert.equal(result.cancelled, false);
+        assert.equal(result.cancelError, "cancel timed out");
+        assert.equal((await capture.settled).response, "VERDICT");
+    });
+
+    await t.test("a stop that races the start waits for it", async () => {
+        const capture = createReviewCapture();
+        const { calls, cancel } = recordingCancel();
+        const pending = captureOwnedStop(capture, stop("bg-mine"), { cancel, startWaitMs: 1000 });
+        setTimeout(() => capture.start("bg-mine"), 10);
+        assert.equal((await pending).owned, true);
+        assert.deepEqual(calls, ["bg-mine"]);
+    });
+
+    await t.test("the wait for a start is bounded", async () => {
+        const capture = createReviewCapture();
+        const { calls, cancel } = recordingCancel();
+        const began = Date.now();
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-mine"), { cancel, startWaitMs: 30 }), { owned: false });
+        assert.ok(Date.now() - began < 500);
+        assert.deepEqual(calls, []);
+    });
+
+    await t.test("a failed start releases a waiting stop as not owned", async () => {
+        const capture = createReviewCapture();
+        const { cancel } = recordingCancel();
+        const pending = captureOwnedStop(capture, stop("bg-mine"), { cancel, startWaitMs: 1000 });
+        capture.start(null);
+        assert.deepEqual(await pending, { owned: false });
+    });
+
+    await t.test("only the first stop is claimed", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { calls, cancel } = recordingCancel();
+        assert.equal((await captureOwnedStop(capture, stop("bg-mine"), { cancel })).owned, true);
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-mine"), { cancel }), { owned: false });
+        assert.deepEqual(calls, ["bg-mine"]);
+    });
+
+    await t.test("a review that has already returned is not cancelled again", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        capture.done = true;
+        const { calls, cancel } = recordingCancel();
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-mine"), { cancel }), { owned: false });
+        assert.deepEqual(calls, []);
+    });
+
+    await t.test("a blank or missing response is passed through for the caller to reject", async () => {
+        for (const response of ["", "   ", undefined]) {
+            const capture = createReviewCapture();
+            capture.start("bg-mine");
+            const { cancel } = recordingCancel();
+            const result = await captureOwnedStop(capture, { agentId: "bg-mine", response }, { cancel });
+            assert.equal(result.owned, true);
+            assert.equal(result.response, typeof response === "string" ? response : "");
+        }
     });
 });

@@ -12,7 +12,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { bootExtension } from "./harness/host.mjs";
+import { bootExtension, VERDICT_AGENT_ID } from "./harness/host.mjs";
 
 const CONCERN = { severity: "concern", note: "The retry loop drops the last attempt's error." };
 const NIT = { severity: "nit", note: "Prefer a named constant over the literal 3600." };
@@ -221,4 +221,102 @@ test("a review is shown each tool result under its tool's name", async () => {
     const prompt = host.startedAgents[0].prompt;
     assert.match(prompt, /TOOL_RESULT powershell \[ok\]: 41 passing/);
     assert.doesNotMatch(prompt, /TOOL_RESULT undefined/);
+});
+
+// The review agent's "has finished" notification is suppressed only by cancelling the agent before
+// the host completes it, and `onSubagentStop` is the one point where that is guaranteed. These keep
+// the verdict out of the event log, so the hook is the only path that can deliver it.
+async function reviewAwaitingStop(verdict) {
+    const host = await bootExtension();
+    host.verdictInEventLog = false;
+    const check = host.startCheck(verdict);
+    await check.started;
+    return { host, check, agentId: `task-${host.startedAgents.length}` };
+}
+
+test("registers the sub-agent stop hook", async () => {
+    const host = await bootExtension();
+    assert.equal(typeof host.registered.hooks.onSubagentStop, "function");
+});
+
+test("the review agent's stop is cancelled and its reply becomes the verdict", async () => {
+    const { host, check, agentId } = await reviewAwaitingStop(CONCERN);
+
+    const out = await host.subagentStop({ agentId, response: JSON.stringify(CONCERN) });
+    assert.equal(out, undefined, "the hook must never block the agent or rewrite its reply");
+    assert.equal(host.cancelled[0], agentId);
+
+    await check.done;
+    assert.match(await host.status(), /pending advice: concern/);
+    assert.ok(host.removed.includes(agentId), "a cancelled review leaves no task behind");
+});
+
+test("the review does not return until the hook's cancel has", async () => {
+    const { host, check, agentId } = await reviewAwaitingStop(CONCERN);
+    let release;
+    host.cancelResult = new Promise((resolve) => (release = () => resolve({ cancelled: true })));
+
+    let hookReturned = false;
+    const hook = host.subagentStop({ agentId, response: JSON.stringify(CONCERN) }).then(() => {
+        hookReturned = true;
+    });
+    await host.quiesce();
+    assert.equal(hookReturned, false, "the hook returned before its cancel did");
+    assert.match(await host.status(), /pending advice: none/, "the review returned before the cancel did");
+
+    release();
+    await hook;
+    await check.done;
+    assert.match(await host.status(), /pending advice: concern/);
+});
+
+test("another sub-agent's stop is left alone", async () => {
+    const { host, check, agentId } = await reviewAwaitingStop(CONCERN);
+
+    assert.equal(await host.subagentStop({ agentId: "9f2c0a1e-users-own", response: "done" }), undefined);
+    assert.deepEqual(host.cancelled, [], "the user's own sub-agent must never be cancelled");
+
+    await host.subagentStop({ agentId, response: JSON.stringify(CONCERN) });
+    await check.done;
+    assert.ok(!host.cancelled.includes("9f2c0a1e-users-own"));
+    assert.match(await host.status(), /pending advice: concern/);
+});
+
+test("a sub-agent stop with no review running is left alone", async () => {
+    const host = await bootExtension();
+    assert.equal(await host.subagentStop({ agentId: "task-1", response: "done" }), undefined);
+    assert.deepEqual(host.cancelled, []);
+});
+
+test("a stop-hook cancel that did not take keeps the task readable", async () => {
+    const { host, check, agentId } = await reviewAwaitingStop(CONCERN);
+    host.cancelResult = { cancelled: false };
+
+    await host.subagentStop({ agentId, response: JSON.stringify(CONCERN) });
+    await check.done;
+    assert.match(await host.status(), /pending advice: concern/, "the reply is valid either way");
+    assert.ok(!host.removed.includes(agentId), "its notification may follow, so read_agent must find it");
+});
+
+test("a verdict followed by a remark is still the verdict", async () => {
+    const { host, check, agentId } = await reviewAwaitingStop(CONCERN);
+
+    // The agent's last message is not the verdict, so neither the hook's reply nor the poll's
+    // reading of the latest message carries it. Emitted in the same tick as the stop.
+    const message = (content) => host.emit({ type: "assistant.message", agentId: VERDICT_AGENT_ID, data: { content } });
+    message(JSON.stringify(CONCERN));
+    message("Review complete.");
+    await host.subagentStop({ agentId, response: "Review complete." });
+    await check.done;
+    assert.match(await host.status(), /pending advice: concern/);
+});
+
+test("a stop with no reply anywhere is an error, never a clean review", async () => {
+    const { host, check, agentId } = await reviewAwaitingStop(CONCERN);
+
+    await host.subagentStop({ agentId, response: "" });
+    await check.done;
+    const status = await host.status();
+    assert.match(status, /pending advice: none/);
+    assert.match(status, /last error:\s+advisor agent stopped without a reply/);
 });
