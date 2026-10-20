@@ -145,7 +145,10 @@ function createHost(sessionId) {
             host.sends.push({ prompt, options });
         },
         async getEvents() {
-            return events.slice();
+            // The real host does not return ephemeral events here: a HydraFusion phase's live work
+            // is ephemeral and was absent from `getEvents()` until its commit replayed it (CLI
+            // 1.0.99-2). Returning them would let a test pass on a path the host never offers.
+            return events.filter((e) => !e.ephemeral);
         },
         rpc: {
             plan: {

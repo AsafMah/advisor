@@ -29,6 +29,14 @@ import {
     PROMPT_OWNER_SUB_AGENT,
     createReviewCapture,
     captureOwnedStop,
+    isLivePhaseWork,
+    fusionWorkKey,
+    createFusionPhase,
+    bufferPhaseEvent,
+    drainPhaseEvents,
+    renderPhaseWork,
+    selectReviewableEvents,
+    rememberBounded,
 } from "./lib.mjs";
 
 // The activity panel — the ring the canvas renders, and the loopback server it talks to. Kept in
@@ -132,6 +140,11 @@ const DISPOSE_TIMEOUT_MS = 5000;
 // a stop that is not the review's is held up by no more than this.
 const STOP_START_WAIT_MS = 2000;
 
+// Fusion work already reviewed live, remembered so its commit replay is not reviewed again — see
+// `selectReviewableEvents`. Only the current fusion's replay can match, so a bound well above one
+// turn's work forgets nothing that matters.
+const REVIEWED_FUSION_WORK_LIMIT = 1024;
+
 function loadConfig(workingDirectory) {
     const candidates = [
         process.env.COPILOT_ADVISOR_CONFIG,
@@ -177,6 +190,7 @@ const state = {
     epochReason: "",
     // The HydraFusion turn in progress, if any — see `noteFusionResolved`.
     fusion: null,
+    reviewedFusionWork: new Set(),
     lastAdviceNote: "",
     lastAdviceAt: 0,
     verdictHistory: [],
@@ -265,9 +279,10 @@ function recordAdvice(severity, note, outcome) {
 }
 
 // A review judges the snapshot it was given, and finishes tens of seconds later. Once the agent
-// crosses one of these boundaries — the user spoke, a new agentic loop began, a fusion committed
-// its buffered work, the turn ended — that snapshot describes a situation the agent has left, and
-// its verdict delivered now is the "stale advice" the agent then has to argue with. The commonest
+// crosses one of these boundaries — the user spoke, a new agentic loop began, a fusion phase started
+// or ended, a fusion committed its buffered work, the turn ended — that snapshot describes a
+// situation the agent has left, and its verdict delivered now is the "stale advice" the agent then
+// has to argue with. The commonest
 // route, measured over ten days of logs: the review agent finishing wakes the idle main agent with
 // a fresh turn, and the verdict landed on that turn's first tool call.
 //
@@ -498,10 +513,18 @@ async function buildTranscriptDelta(session) {
     // advisor's own verdict and its own file reads come back in the next delta rendered as things
     // the main agent said and did, and other extensions' sub-agents get mixed in too.
     const options = { toolNames: toolNamesByCallId(events), maxToolResultChars: cfg("maxToolResultChars") };
-    const lines = delta
-        .filter((e) => !e?.agentId)
+    const lines = selectReviewableEvents(delta, state.reviewedFusionWork)
         .map((e) => renderEvent(e, options))
         .filter(Boolean);
+
+    // A fusion phase's work is not in the event log until its commit, so it comes from the buffer
+    // `bufferFusionWork` fills. It follows the persisted lines because it happened after them.
+    const phase = state.fusion?.phase;
+    if (phase) {
+        const drained = drainPhaseEvents(phase);
+        rememberBounded(state.reviewedFusionWork, drained.events.map(fusionWorkKey), REVIEWED_FUSION_WORK_LIMIT);
+        lines.push(...renderPhaseWork(phase, drained, options));
+    }
     if (lines.length === 0) return null;
 
     // Keep the tail: the most recent activity is what needs reviewing.
@@ -1662,6 +1685,14 @@ const session = await joinSession({
             // fire later. The invocation carries the main session id directly.
             if (!isMainAgentStop(input, invocation?.sessionId)) return;
 
+            // A fusion phase's solver can stop with the fusion still running, and the block's
+            // reason would arrive as a user message in the middle of it. Phase ends invalidate, so
+            // anything pending here is dropped and shown as undelivered instead.
+            if (state.fusion) {
+                debug("ignoring agent stop inside a fusion");
+                return;
+            }
+
             // A re-entry after a previous block. The runtime caps consecutive blocks, but spending
             // that budget to re-raise advice the agent is already acting on would only delay it.
             if (input?.stopHookActive) return;
@@ -1880,27 +1911,72 @@ function handleUserMessage(event) {
     invalidateSnapshot("new user message");
 }
 
-// HydraFusion runs a turn as hidden phases and then commits the chosen phase's work in one burst.
-// Measured over 34 fusion sessions: all 5068 main-agent tool calls tagged `data.fusion` arrived
-// inside a commit window, and none outside one. So until the commit there is nothing reviewable,
-// and during it the calls are a replay of finished work arriving faster than a review can answer —
-// every review fired there judged a snapshot that was stale before its verdict landed. Reviews
-// therefore pause from `fusion_resolved` until `fusion_completed`.
+// HydraFusion runs a turn as phases — a solver, a judge, a repair — then commits the chosen phase's
+// work by replaying it. A root-scope phase is the agent working live: its tool calls execute, the
+// tool-use hooks fire for them, and context a hook returns reaches the phase (measured for
+// `onPostToolUse`). Its events are ephemeral and absent from `getEvents()` until the commit replays
+// them, so it is reviewed from a buffer filled as they stream (`bufferFusionWork`). That absence is
+// also why 34 fusion sessions measured earlier showed every fusion-tagged call inside a commit
+// window: they read the persisted log, which holds nothing else.
 //
-// These are session-level events and carry no `agentId`. `fusion_commit_started` is absent from
-// the SDK typings but was emitted exactly once by each of 171 fusions. No two fusions overlapped in
-// 179, so one slot is enough, and a new fusion resolving proves any earlier one is over.
+// Reviews run only while exactly one root-scope phase is open, and pause everywhere else in the
+// fusion, as they once did for all of it: a review-scope phase (a judge) is not the agent's work,
+// the hooks carry no phase identity so overlapping phases cannot be told apart, and the commit
+// replays finished work faster than a review can answer. Every phase start and end invalidates —
+// the next phase may be a different attempt at the same turn, and one attempt's verdict must not
+// land in another.
+//
+// These are session-level events and carry no `agentId`. `fusion_commit_started` and
+// `fusion_handoff` are absent from the SDK typings; the commit event was emitted exactly once by
+// each of 171 fusions. No two fusions overlapped in 179, so one slot is enough, and a new fusion
+// resolving proves any earlier one is over.
 //
 // Fails open, because a fusion left open would silence the advisor: a user abort was observed to
 // end a fusion with a cancelled phase and no `fusion_completed`, so `abort` and idle both close it.
 // A user message must not — steering messages arrive mid-fusion, and `fusion_resolved` itself
 // arrives just before the turn's own `user.message`.
+function openFusion(fusionId, pattern) {
+    state.fusion = { id: fusionId, pattern, committing: false, unreviewed: 0, phase: null, openPhases: new Set() };
+}
+
 function noteFusionResolved(event) {
     const { fusionId, pattern } = event?.data ?? {};
     if (event?.agentId || !fusionId) return;
     if (state.fusion && state.fusion.id !== fusionId) endFusion(`superseded by ${fusionId}`);
-    state.fusion = { id: fusionId, pattern, committing: false, unreviewed: 0 };
-    debug(`fusion ${fusionId} (${pattern}) open: pausing reviews`);
+    openFusion(fusionId, pattern);
+    debug(`fusion ${fusionId} (${pattern}) open: reviewing live root phases only`);
+}
+
+function noteFusionPhaseStarted(event) {
+    const { fusionId, phaseId, phaseKind, conversationScope } = event?.data ?? {};
+    const fusion = state.fusion;
+    if (event?.agentId || !phaseId || fusion?.id !== fusionId) return;
+    fusion.openPhases.add(phaseId);
+    const reviewable = fusion.openPhases.size === 1 && conversationScope === "root" && !fusion.committing;
+    fusion.phase = reviewable ? createFusionPhase({ phaseId, phaseKind }) : null;
+    debug(
+        `fusion phase ${phaseId} (${phaseKind}, ${conversationScope}) started:` +
+            ` ${reviewable ? "reviewing" : "pausing reviews"}`,
+    );
+    invalidateSnapshot("fusion phase started");
+}
+
+function noteFusionPhaseEnded(event) {
+    const { fusionId, phaseId } = event?.data ?? {};
+    const fusion = state.fusion;
+    if (event?.agentId || !phaseId || fusion?.id !== fusionId) return;
+    fusion.openPhases.delete(phaseId);
+    if (fusion.phase?.id === phaseId) fusion.phase = null;
+    invalidateSnapshot(event.type === "assistant.fusion_phase_failed" ? "fusion phase failed" : "fusion phase ended");
+}
+
+// Observed between a judge and the repair phase it hands off to. Its shape is unpublished, so it
+// is treated as a boundary and nothing more.
+function noteFusionHandoff(event) {
+    const fusion = state.fusion;
+    if (event?.agentId || fusion?.id !== event?.data?.fusionId) return;
+    fusion.phase = null;
+    invalidateSnapshot("fusion handoff");
 }
 
 function noteFusionCommitStarted(event) {
@@ -1908,9 +1984,10 @@ function noteFusionCommitStarted(event) {
     if (event?.agentId || !fusionId) return;
     if (state.fusion?.id !== fusionId) {
         endFusion(`superseded by ${fusionId}`);
-        state.fusion = { id: fusionId, pattern: null, unreviewed: 0 };
+        openFusion(fusionId, null);
     }
     state.fusion.committing = true;
+    state.fusion.phase = null;
     invalidateSnapshot("fusion commit");
 }
 
@@ -1925,6 +2002,15 @@ function endFusion(how) {
     if (!fusion) return;
     state.fusion = null;
     debug(`fusion ${fusion.id} ended (${how}): ${fusion.unreviewed} tool calls went unreviewed`);
+    // A phase still open was abandoned, not committed, so a verdict about it describes nothing.
+    if (fusion.phase) invalidateSnapshot(`fusion ended: ${how}`);
+}
+
+// Fusion work streams through `session.on` before any handler acts on it, so a review that the
+// same event triggers already has it in its transcript.
+function bufferFusionWork(event) {
+    const phase = state.fusion?.phase;
+    if (phase && isLivePhaseWork(event, phase.id)) bufferPhaseEvent(phase, event);
 }
 
 // A turn id of "0" starts a new agentic loop. Outside a fusion commit, that is a turn the agent
@@ -1945,8 +2031,12 @@ function countToolCall(event) {
     if (!cfg("enabled")) return;
     if (USER_INPUT_TOOLS.has(event?.data?.toolName)) return;
 
-    // The tag also covers a fusion whose `fusion_resolved` this process never saw.
-    if (state.fusion || event?.data?.fusion) {
+    // Only the reviewable phase's live calls count; inside a fusion everything else pauses — see
+    // `noteFusionResolved`. The tag also covers a fusion whose `fusion_resolved` this process never
+    // saw.
+    const phase = state.fusion?.phase;
+    const livePhaseCall = Boolean(phase) && isLivePhaseWork(event, phase.id);
+    if (!livePhaseCall && (state.fusion || event?.data?.fusion)) {
         if (state.fusion) state.fusion.unreviewed++;
         return;
     }
@@ -2017,12 +2107,18 @@ session.on((event) => {
         case "hook.end":
             noteHookEnd(event);
             break;
+        case "assistant.message":
+        case "assistant.intent":
+            bufferFusionWork(event);
+            break;
         case "tool.execution_start":
+            bufferFusionWork(event);
             // Recorded before counting, so a review this call triggers sees it as in flight.
             noteCallStarted(event);
             countToolCall(event);
             break;
         case "tool.execution_complete":
+            bufferFusionWork(event);
             noteCallFinished(event);
             releaseQueuedCheck(event);
             break;
@@ -2031,6 +2127,16 @@ session.on((event) => {
             break;
         case "session.fusion_resolved":
             noteFusionResolved(event);
+            break;
+        case "assistant.fusion_phase_started":
+            noteFusionPhaseStarted(event);
+            break;
+        case "assistant.fusion_phase_completed":
+        case "assistant.fusion_phase_failed":
+            noteFusionPhaseEnded(event);
+            break;
+        case "session.fusion_handoff":
+            noteFusionHandoff(event);
             break;
         case "session.fusion_commit_started":
             noteFusionCommitStarted(event);
