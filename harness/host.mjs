@@ -117,6 +117,11 @@ function createHost(sessionId) {
         // prompt is a turn, and moving a slider is not the user speaking.
         sends: [],
         verdict: null,
+        // Off for the scenarios where the reply must come from the stop hook: with the verdict in
+        // the event log the poll loop finds it first and never reaches the hook path.
+        verdictInEventLog: true,
+        // What `tasks.cancel` reports, shaped like the SDK's `TasksCancelResult`.
+        cancelResult: { cancelled: true },
         registered: null,
     };
 
@@ -140,7 +145,10 @@ function createHost(sessionId) {
             host.sends.push({ prompt, options });
         },
         async getEvents() {
-            return events.slice();
+            // The real host does not return ephemeral events here: a HydraFusion phase's live work
+            // is ephemeral and was absent from `getEvents()` until its commit replayed it (CLI
+            // 1.0.99-2). Returning them would let a test pass on a path the host never offers.
+            return events.filter((e) => !e.ephemeral);
         },
         rpc: {
             plan: {
@@ -166,11 +174,13 @@ function createHost(sessionId) {
                         agentId: VERDICT_AGENT_ID,
                         data: { toolCallId: VERDICT_TOOL_CALL_ID },
                     });
-                    emit({
-                        type: "assistant.message",
-                        agentId: VERDICT_AGENT_ID,
-                        data: { content: JSON.stringify(host.verdict) },
-                    });
+                    if (host.verdictInEventLog) {
+                        emit({
+                            type: "assistant.message",
+                            agentId: VERDICT_AGENT_ID,
+                            data: { content: JSON.stringify(host.verdict) },
+                        });
+                    }
                     return { agentId };
                 },
                 async list() {
@@ -186,6 +196,7 @@ function createHost(sessionId) {
                 },
                 async cancel({ id }) {
                     cancelled.push(id);
+                    return host.cancelResult;
                 },
                 async remove({ id }) {
                     removed.push(id);
@@ -242,6 +253,24 @@ function createHost(sessionId) {
             { sessionId, stopReason: "end_turn", ...input },
             { sessionId },
         );
+
+    /**
+     * A sub-agent finishing its turn. Shaped like the SDK's `SubagentStopHookInput`: `agentId` is
+     * the id `startAgent` returned for the task (`task-N` here), and `response` the agent's last
+     * message.
+     */
+    host.subagentStop = (input = {}) =>
+        host.registered.hooks.onSubagentStop(
+            { sessionId, agentName: "rubber-duck", agentType: "rubber-duck", stopReason: "end_turn", ...input },
+            { sessionId },
+        );
+
+    /** Starts a review without awaiting it, for tests that must act while it is in flight. */
+    host.startCheck = (verdict) => {
+        const before = startedAgents.length;
+        const done = host.runCheck(verdict);
+        return { done, started: host.waitFor(() => startedAgents.length > before, "review agent start") };
+    };
 
     /**
      * Reads the extension's own view of its state through the `/advisor` command, which is the

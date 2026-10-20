@@ -31,6 +31,16 @@ import {
     isAdvisorFollowUp,
     PROMPT_OWNER_MAIN,
     PROMPT_OWNER_SUB_AGENT,
+    createReviewCapture,
+    captureOwnedStop,
+    isLivePhaseWork,
+    fusionWorkKey,
+    createFusionPhase,
+    bufferPhaseEvent,
+    drainPhaseEvents,
+    renderPhaseWork,
+    selectReviewableEvents,
+    rememberBounded,
 } from "./lib.mjs";
 
 const fence = "```";
@@ -771,5 +781,340 @@ test("a tool result is named after the call that produced it", async (t) => {
         const line = renderEvent(failed, { toolNames: toolNamesByCallId([start]), maxToolResultChars: 100 });
         assert.match(line, /^TOOL_RESULT powershell \[FAILED\]: /);
         assert.ok(line.length < 200, `expected truncation, got ${line.length} chars`);
+    });
+});
+
+// The stop hook is the only point at which cancelling the review agent is guaranteed to beat its
+// completion notification, so ownership and ordering are what these pin down.
+test("captureOwnedStop", async (t) => {
+    const stop = (agentId, response = '{"severity":"none"}') => ({ agentId, agentType: "rubber-duck", stopReason: "end_turn", response });
+    const recordingCancel = (result = { cancelled: true }) => {
+        const calls = [];
+        const cancel = async (id) => {
+            calls.push(id);
+            return result;
+        };
+        return { calls, cancel };
+    };
+
+    await t.test("another agent's stop is ignored and never cancelled", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { calls, cancel } = recordingCancel();
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-theirs"), { cancel }), { owned: false });
+        assert.deepEqual(calls, []);
+        assert.equal(capture.claimed, false);
+    });
+
+    await t.test("a stop without an agent id, or with no review running, is ignored", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { calls, cancel } = recordingCancel();
+        assert.deepEqual(await captureOwnedStop(capture, stop(undefined), { cancel }), { owned: false });
+        assert.deepEqual(await captureOwnedStop(null, stop("bg-mine"), { cancel }), { owned: false });
+        assert.deepEqual(calls, []);
+    });
+
+    await t.test("the owned stop is cancelled before the review is settled", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        let releaseCancel;
+        const order = [];
+        const cancel = (id) =>
+            new Promise((resolve) => {
+                order.push(`cancel ${id}`);
+                releaseCancel = () => resolve({ cancelled: true });
+            });
+        void capture.settled.then(() => order.push("settled"));
+
+        const pending = captureOwnedStop(capture, stop("bg-mine", "VERDICT"), { cancel });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.deepEqual(order, ["cancel bg-mine"], "settled before the cancel returned");
+        assert.equal(capture.claimed, true);
+
+        releaseCancel();
+        const result = await pending;
+        assert.deepEqual(result, { owned: true, response: "VERDICT", cancelled: true, cancelError: null });
+        assert.deepEqual(await capture.settled, { response: "VERDICT", cancelled: true, cancelError: null });
+        assert.deepEqual(order, ["cancel bg-mine", "settled"]);
+    });
+
+    await t.test("a cancel that did not take is reported, not assumed", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { cancel } = recordingCancel({ cancelled: false });
+        const result = await captureOwnedStop(capture, stop("bg-mine"), { cancel });
+        assert.equal(result.cancelled, false);
+        assert.equal((await capture.settled).cancelled, false);
+    });
+
+    await t.test("a cancel that throws is recorded and still settles the review", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const cancel = async () => {
+            throw new Error("cancel timed out");
+        };
+        const result = await captureOwnedStop(capture, stop("bg-mine", "VERDICT"), { cancel });
+        assert.equal(result.cancelled, false);
+        assert.equal(result.cancelError, "cancel timed out");
+        assert.equal((await capture.settled).response, "VERDICT");
+    });
+
+    await t.test("a stop that races the start waits for it", async () => {
+        const capture = createReviewCapture();
+        const { calls, cancel } = recordingCancel();
+        const pending = captureOwnedStop(capture, stop("bg-mine"), { cancel, startWaitMs: 1000 });
+        setTimeout(() => capture.start("bg-mine"), 10);
+        assert.equal((await pending).owned, true);
+        assert.deepEqual(calls, ["bg-mine"]);
+    });
+
+    await t.test("the wait for a start is bounded", async () => {
+        const capture = createReviewCapture();
+        const { calls, cancel } = recordingCancel();
+        const began = Date.now();
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-mine"), { cancel, startWaitMs: 30 }), { owned: false });
+        assert.ok(Date.now() - began < 500);
+        assert.deepEqual(calls, []);
+    });
+
+    await t.test("a failed start releases a waiting stop as not owned", async () => {
+        const capture = createReviewCapture();
+        const { cancel } = recordingCancel();
+        const pending = captureOwnedStop(capture, stop("bg-mine"), { cancel, startWaitMs: 1000 });
+        capture.start(null);
+        assert.deepEqual(await pending, { owned: false });
+    });
+
+    await t.test("only the first stop is claimed", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        const { calls, cancel } = recordingCancel();
+        assert.equal((await captureOwnedStop(capture, stop("bg-mine"), { cancel })).owned, true);
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-mine"), { cancel }), { owned: false });
+        assert.deepEqual(calls, ["bg-mine"]);
+    });
+
+    await t.test("a review that has already returned is not cancelled again", async () => {
+        const capture = createReviewCapture();
+        capture.start("bg-mine");
+        capture.done = true;
+        const { calls, cancel } = recordingCancel();
+        assert.deepEqual(await captureOwnedStop(capture, stop("bg-mine"), { cancel }), { owned: false });
+        assert.deepEqual(calls, []);
+    });
+
+    await t.test("a blank or missing response is passed through for the caller to reject", async () => {
+        for (const response of ["", "   ", undefined]) {
+            const capture = createReviewCapture();
+            capture.start("bg-mine");
+            const { cancel } = recordingCancel();
+            const result = await captureOwnedStop(capture, { agentId: "bg-mine", response }, { cancel });
+            assert.equal(result.owned, true);
+            assert.equal(result.response, typeof response === "string" ? response : "");
+        }
+    });
+});
+
+// Shapes taken from a recorded cascade fusion on 1.0.99-2: live phase work is ephemeral and tagged
+// with its phase, and the commit replays the selected phase with the same call ids under a
+// `commitId`.
+const FUSION_ID = "fusion-1";
+const PHASE_ID = `${FUSION_ID}:phase:0`;
+const phaseTag = (extra = {}) => ({
+    fusionId: FUSION_ID,
+    pattern: "cascade",
+    policy: "max",
+    phaseId: PHASE_ID,
+    phaseKind: "primary",
+    role: "solver",
+    conversationScope: "root",
+    ...extra,
+});
+const liveStart = (id, tag = {}, toolName = "view") => ({
+    type: "tool.execution_start",
+    ephemeral: true,
+    data: { toolCallId: id, toolName, arguments: { path: "a.txt" }, fusion: phaseTag(tag) },
+});
+const liveComplete = (id, tag = {}) => ({
+    type: "tool.execution_complete",
+    ephemeral: true,
+    data: { toolCallId: id, success: true, result: "contents", fusion: phaseTag(tag) },
+});
+const liveMessage = (content, tag = {}) => ({
+    type: "assistant.message",
+    ephemeral: true,
+    data: { content, fusion: phaseTag(tag) },
+});
+const liveIntent = (intent) => ({ type: "assistant.intent", ephemeral: true, data: { intent, fusion: phaseTag() } });
+const replayOf = (event) => {
+    const { ephemeral, ...persisted } = event;
+    return { ...persisted, data: { ...event.data, fusion: { ...event.data.fusion, commitId: `${FUSION_ID}:commit` } } };
+};
+
+test("isLivePhaseWork", async (t) => {
+    await t.test("accepts the open phase's own ordinary work", () => {
+        for (const event of [liveStart("c1"), liveComplete("c1"), liveMessage("hi"), liveIntent("Reading")]) {
+            assert.equal(isLivePhaseWork(event, PHASE_ID), true, event.type);
+        }
+    });
+
+    await t.test("rejects the commit's replay of that same work", () => {
+        assert.equal(isLivePhaseWork(replayOf(liveStart("c1")), PHASE_ID), false);
+    });
+
+    await t.test("rejects another phase's work", () => {
+        assert.equal(isLivePhaseWork(liveStart("c1", { phaseId: `${FUSION_ID}:repair` }), PHASE_ID), false);
+    });
+
+    await t.test("rejects review-scope work", () => {
+        assert.equal(isLivePhaseWork(liveStart("c1", { conversationScope: "review" }), PHASE_ID), false);
+    });
+
+    await t.test("rejects a sub-agent's events", () => {
+        assert.equal(isLivePhaseWork({ ...liveStart("c1"), agentId: "sub-1" }, PHASE_ID), false);
+    });
+
+    await t.test("rejects phase metadata and untagged events", () => {
+        const activity = {
+            type: "assistant.fusion_phase_activity",
+            ephemeral: true,
+            data: { fusionId: FUSION_ID, phaseId: PHASE_ID, activity: "model_output" },
+        };
+        const untagged = { type: "tool.execution_start", data: { toolCallId: "c1", toolName: "view" } };
+        assert.equal(isLivePhaseWork(activity, PHASE_ID), false);
+        assert.equal(isLivePhaseWork(untagged, PHASE_ID), false);
+    });
+
+    await t.test("rejects everything when no phase is open", () => {
+        assert.equal(isLivePhaseWork(liveStart("c1"), null), false);
+        assert.equal(isLivePhaseWork(liveStart("c1"), undefined), false);
+    });
+});
+
+test("fusionWorkKey", async (t) => {
+    await t.test("a replay has the same key as the live event it repeats", () => {
+        for (const event of [liveStart("c1"), liveComplete("c1"), liveMessage("hi"), liveIntent("Reading")]) {
+            const key = fusionWorkKey(event);
+            assert.ok(key, event.type);
+            assert.equal(fusionWorkKey(replayOf(event)), key, event.type);
+        }
+    });
+
+    await t.test("a call's start and its result are different work", () => {
+        assert.notEqual(fusionWorkKey(liveStart("c1")), fusionWorkKey(liveComplete("c1")));
+    });
+
+    await t.test("the same call id in another phase is different work", () => {
+        assert.notEqual(
+            fusionWorkKey(liveStart("c1")),
+            fusionWorkKey(liveStart("c1", { phaseId: `${FUSION_ID}:repair` })),
+        );
+    });
+
+    await t.test("an event with nothing to identify it has no key", () => {
+        assert.equal(fusionWorkKey(liveMessage("")), null);
+        assert.equal(fusionWorkKey({ type: "tool.execution_start", data: { toolCallId: "c1" } }), null);
+        assert.equal(fusionWorkKey({ type: "user.message", data: { content: "x", fusion: phaseTag() } }), null);
+    });
+});
+
+test("fusion phase buffer", async (t) => {
+    const phase = (limit) => createFusionPhase({ phaseId: PHASE_ID, phaseKind: "primary" }, limit);
+
+    await t.test("drains in arrival order, then starts empty", () => {
+        const p = phase(10);
+        const events = [liveMessage("plan"), liveStart("c1"), liveComplete("c1")];
+        for (const e of events) bufferPhaseEvent(p, e);
+        assert.deepEqual(drainPhaseEvents(p), { events, dropped: 0 });
+        assert.deepEqual(drainPhaseEvents(p), { events: [], dropped: 0 });
+    });
+
+    await t.test("keeps the newest events past its limit and counts the rest", () => {
+        const p = phase(3);
+        const events = ["a", "b", "c", "d", "e"].map((c) => liveMessage(c));
+        for (const e of events) bufferPhaseEvent(p, e);
+        assert.deepEqual(drainPhaseEvents(p), { events: events.slice(2), dropped: 2 });
+        assert.deepEqual(drainPhaseEvents(p), { events: [], dropped: 0 });
+    });
+
+    await t.test("names a result whose call was drained by an earlier review", () => {
+        const p = phase(10);
+        bufferPhaseEvent(p, liveStart("c1"));
+        drainPhaseEvents(p);
+        bufferPhaseEvent(p, liveComplete("c1"));
+        const lines = renderPhaseWork(p, drainPhaseEvents(p));
+        assert.ok(lines.some((l) => l.startsWith("TOOL_RESULT view [ok]")), lines.join("\n"));
+    });
+
+    await t.test("remembers no more tool names than its limit", () => {
+        const p = phase(2);
+        for (const id of ["c1", "c2", "c3"]) bufferPhaseEvent(p, liveStart(id));
+        assert.deepEqual([...p.toolNames.keys()], ["c2", "c3"]);
+    });
+});
+
+test("renderPhaseWork", async (t) => {
+    const phase = createFusionPhase({ phaseId: PHASE_ID, phaseKind: "repair" });
+
+    await t.test("labels the work as an unfinished phase that may not be kept", () => {
+        const lines = renderPhaseWork(phase, { events: [liveStart("c1")], dropped: 0 });
+        assert.match(lines[0], /HydraFusion repair phase/);
+        assert.match(lines[0], /may not be kept/);
+        assert.equal(lines[1], 'TOOL_CALL view: {"path":"a.txt"}');
+        assert.equal(lines.length, 2);
+    });
+
+    await t.test("says how much the buffer had to drop", () => {
+        const lines = renderPhaseWork(phase, { events: [liveMessage("x")], dropped: 7 });
+        assert.ok(lines.some((l) => /7 earlier phase events omitted/.test(l)), lines.join("\n"));
+    });
+
+    await t.test("renders nothing when nothing in the phase is reviewable", () => {
+        assert.deepEqual(renderPhaseWork(phase, { events: [liveMessage("")], dropped: 3 }), []);
+        assert.deepEqual(renderPhaseWork(phase, { events: [], dropped: 0 }), []);
+    });
+
+    await t.test("applies the tool result cap", () => {
+        const long = { ...liveComplete("c1"), data: { ...liveComplete("c1").data, result: "x".repeat(50) } };
+        const p = createFusionPhase({ phaseId: PHASE_ID, phaseKind: "primary" });
+        bufferPhaseEvent(p, liveStart("c1"));
+        const lines = renderPhaseWork(p, { events: [long], dropped: 0 }, { maxToolResultChars: 10 });
+        assert.ok(lines[1].length < 60, lines[1]);
+    });
+});
+
+test("selectReviewableEvents", async (t) => {
+    const userMessage = { type: "user.message", data: { content: "do it" } };
+
+    await t.test("drops a replay of work already reviewed live", () => {
+        const reviewed = new Set([fusionWorkKey(liveStart("c1")), fusionWorkKey(liveComplete("c1"))]);
+        const events = [replayOf(liveStart("c1")), replayOf(liveComplete("c1")), replayOf(liveStart("c2"))];
+        assert.deepEqual(selectReviewableEvents(events, reviewed), [replayOf(liveStart("c2"))]);
+    });
+
+    await t.test("keeps ordinary events, including ones that share a reviewed key's shape", () => {
+        const reviewed = new Set([fusionWorkKey(liveStart("c1"))]);
+        const ordinary = { type: "tool.execution_start", data: { toolCallId: "c1", toolName: "view" } };
+        assert.deepEqual(selectReviewableEvents([userMessage, ordinary], reviewed), [userMessage, ordinary]);
+    });
+
+    await t.test("still drops sub-agent events", () => {
+        const sub = { ...userMessage, agentId: "sub-1" };
+        assert.deepEqual(selectReviewableEvents([sub, userMessage], new Set()), [userMessage]);
+    });
+});
+
+test("rememberBounded", async (t) => {
+    await t.test("evicts the oldest values first", () => {
+        const set = new Set();
+        rememberBounded(set, ["a", "b", "c", "d"], 3);
+        assert.deepEqual([...set], ["b", "c", "d"]);
+    });
+
+    await t.test("ignores missing values", () => {
+        const set = new Set();
+        rememberBounded(set, [null, "a", undefined], 3);
+        assert.deepEqual([...set], ["a"]);
     });
 });

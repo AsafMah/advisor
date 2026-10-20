@@ -89,7 +89,8 @@ judged, and invalidated when the agent crosses a boundary that snapshot cannot d
 - a new user message, including a steering message mid-turn;
 - a new agentic loop (`assistant.turn_start` with turn id `0`) — which is also how an idle agent
   is woken when a background task finishes, the advisor's own review included;
-- a HydraFusion commit (see [HydraFusion turns are not reviewed](#hydrafusion-turns-are-not-reviewed));
+- a HydraFusion phase starting or ending, a handoff between phases, or the commit (see
+  [HydraFusion turns](#hydrafusion-turns));
 - the turn ending.
 
 Advice still pending at a boundary is dropped, and a verdict that lands after one is never
@@ -104,7 +105,8 @@ follow-up so the agent addresses it before finishing. This starts no review and 
 new — it only delivers advice that already exists, so it costs no latency. Only `blocker` does
 this; concerns and nits keep their previous behaviour, and `blockOnBlocker: false` disables it
 along with the tool-call denial. The runtime caps consecutive blocks, and the advisor declines to
-block on a re-entry from its own previous block, so it cannot hold a turn open indefinitely.
+block on a re-entry from its own previous block, so it cannot hold a turn open indefinitely. Inside
+a HydraFusion turn it never blocks: a phase stopping is not the turn ending.
 
 Treat `blockOnBlocker` as "interrupt me hard", not as a safety control. If you want advice
 without the disruption, set it to `false` and blockers inject as context like everything else.
@@ -333,21 +335,39 @@ instead by the next user turn, which is positive evidence the user is back and t
 they were shown is moot. That keeps a dropped `.completed` event from silencing the advisor for
 the rest of the session.
 
-## HydraFusion turns are not reviewed
+## HydraFusion turns
 
-A HydraFusion turn (the `hydrafusion` models) runs as hidden phases, then commits the chosen
-phase's work in one burst. Measured over 34 sessions, every main-agent tool call tagged with
-`data.fusion` — 5068 of them — arrived inside a commit window, and none outside one. So until the
-commit there is nothing to review, and during it the calls are a replay of finished work arriving
-faster than any review can answer: every review fired there judged a snapshot that was stale
-before its verdict landed.
+A HydraFusion turn (the `hydrafusion` models) runs as phases — a solver, a judge, a repair — then
+commits the chosen phase's work by replaying it. A root-scope phase is the agent working live: its
+tool calls execute, the tool-use hooks fire for them, and context a hook returns reaches the phase
+(measured for `onPostToolUse`). Its events are ephemeral, though: they stream through `session.on`
+but are absent from `getEvents()` until the commit replays them. That absence is why an earlier
+measurement over 34 sessions found every fusion-tagged call inside a commit window — it read the
+persisted log, which holds nothing else.
 
-Reviews therefore pause from `session.fusion_resolved` until `session.fusion_completed`, and a
-call tagged `data.fusion` is never counted even if the fusion's start was missed. The commit
-itself invalidates pending advice; the commit's own agentic loops, which restart at turn id `0`,
-do not invalidate it a second time.
+So the advisor buffers a live phase's messages and tool calls as they stream, and reviews them
+labelled as provisional work the fusion may not keep. The buffer holds the newest 400 events per
+phase; the review is told how many earlier ones it lost. Reviews run only while exactly one
+root-scope phase is open, and pause everywhere else in the fusion:
 
-The pause fails open, because a fusion left open would silence the advisor. A user abort was
+- a review-scope phase (a judge) is not the agent's work;
+- the hooks carry no phase identity, so overlapping phases cannot be told apart — once two
+  overlap, reviews stay paused for the rest of that fusion;
+- the commit replays finished work faster than any review can answer: every review fired there
+  judged a snapshot that was stale before its verdict landed.
+
+A paused call is never counted, and neither is a call tagged `data.fusion` outside a reviewable
+phase, even if the fusion's start was missed.
+
+Every phase start and end (completed or failed), every handoff, and the commit invalidate pending
+advice: the next phase may be a different attempt at the same turn, and one attempt's verdict must
+not land in another. Advice raised in a phase reaches that phase's next tool call, or is shown as
+`UNDELIVERED` when the phase ends first. The commit's own agentic loops, which restart at turn id
+`0`, do not invalidate a second time. Work already reviewed live is skipped when the commit replays
+it; work buffered but not yet reviewed when its phase ended is discarded, and if that phase is the
+one committed, its replay brings the work into the next review.
+
+The fusion's lifecycle fails open, because a fusion left open would silence the advisor. A user abort was
 observed ending a fusion with a cancelled phase and no `fusion_completed`, so an `abort`, the
 session going idle, or the next fusion resolving all close it — no two fusions were ever seen to
 overlap. A user message does not close it: steering messages arrive mid-fusion, and
@@ -356,7 +376,15 @@ overlap. A user message does not close it: steering messages arrive mid-fusion, 
 `session.fusion_commit_started` is absent from the SDK's typings, but every one of 171 fusions
 observed emitted it exactly once. If it stops being emitted, the commit's loops are no longer
 recognised as a replay: each one that restarts at turn id `0` invalidates advice as a new agent
-turn, and `fusion_completed` alone ends the pause.
+turn, and `fusion_completed` alone ends the pause. `session.fusion_handoff` is untyped too, so it
+is used only as a boundary.
+
+Event shapes were measured on one `cascade` fusion (solver, judge, handoff, repair). The advisor
+itself was run through one `single` fusion: all eight reviews ran inside the live phase from the
+buffer, and three blockers each denied a tool call inside it, which the agent read and answered
+before continuing. The judge, handoff and overlap handling are covered by tests only. Never
+observed: the other fusion patterns and phases running concurrently — which fail closed to the
+pause.
 
 ## Cadence and backoff
 
@@ -561,7 +589,19 @@ JSON but not a verdict must not be accepted.
   `classifyPrompt` recognises that element on the way back in, so the advisor never treats its own
   returned text as evidence of what the user wants. Remove the block when a stop hook can return
   `additionalContext`.
-- **Reply recovery.** The reply is read in order of reliability: `task.result`, then
+- **Silent reviews.** The host announces every finished sub-agent to the main agent unless its
+  task is cancelled first. The review agent's stop reaches `onSubagentStop` with its final reply,
+  and when the stop carries the exact agent id `startAgent` returned, the hook cancels that task
+  and hands the reply to the review. Cancelling there, while the host still awaits the hook, is
+  what keeps the "agent finished" notification out of the main agent's context: measured on
+  1.0.99-2, no notification in 4 of 4 runs, and through the extension on 1.0.100-1, none in 15 of
+  15 reviews; returning `modifiedResponse` does not suppress it. The hook never returns anything —
+  `block` would keep the agent running and `modifiedResponse` would rewrite a reply — and ignores
+  every stop that is not the advisor's own, since cancelling one would kill the user's sub-agent.
+  When the stop's reply is blank or not a verdict (an agent can follow its verdict with a remark),
+  the latest parseable reply in the event log is used instead.
+- **Reply recovery.** Without the hook (an older host), or before it fires, the reply is read in
+  order of reliability: `task.result`, then
   `task.latestResponse`, then the session event log. The first two are keyed by the task id the
   extension owns, so they cannot bind to a foreign agent. The event-log fallback exists because
   `tasks.list()` can report the sub-agent as `idle` while leaving `result` null indefinitely; it
@@ -600,7 +640,8 @@ JSON but not a verdict must not be accepted.
   by counting as a quiet review, widens the backoff so reviews become rarer. Errors surface once
   per distinct message; failures that cannot succeed on retry disable the advisor and say so.
 - **Emission guard.** One piece of advice per review; no new review starts while one is in flight,
-  while advice is still pending, or while a HydraFusion turn is open. Identical advice is
+  while advice is still pending, or while a HydraFusion turn is outside a reviewable phase.
+  Identical advice is
   suppressed for five minutes, but never for a `blocker`, so a genuine repeat of the same mistake
   is not silenced — and advice dropped before the agent saw it does not count as given.
 - **Incremental transcript.** Each review sees only what happened since the previous one, plus
@@ -634,14 +675,15 @@ JSON but not a verdict must not be accepted.
   remaining levers are `subagents.agents["rubber-duck"].effortLevel` in `settings.json` or a live
   override via `rpc.tools.updateSubagentSettings`, both of which also affect any `rubber-duck`
   agent you dispatch yourself.
-- Every review emits an "agent finished" system notification into the main agent's context.
-  This is runtime behaviour for background agents and cannot currently be suppressed. When the
+- A review can still emit an "agent finished" system notification into the main agent's context
+  when the cancel in `onSubagentStop` does not take, or on a host without that hook. When the
   main agent has already stopped, that notification wakes it into a new turn; the review's verdict
   is then shown as `UNDELIVERED` rather than handed to the woken agent, but the wake itself still
-  happens.
-- HydraFusion turns get no reviews at all — see
-  [HydraFusion turns are not reviewed](#hydrafusion-turns-are-not-reviewed). The next review after
-  one sees the committed work as recent activity, cut to its last `maxTranscriptChars`.
+  happens. See [Silent reviews](#design-notes).
+- Inside a HydraFusion turn only a lone root-scope phase is reviewed — see
+  [HydraFusion turns](#hydrafusion-turns). Judge phases, overlapping phases and the commit are not;
+  the next review after the commit sees any committed work not already reviewed as recent activity,
+  cut to its last `maxTranscriptChars`.
 - An agent that stops calling tools and answers directly will not be reviewed before it replies.
 - There is no backlog stall: if the advisor falls behind, reviews are skipped rather than
   pausing the main agent.

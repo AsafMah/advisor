@@ -373,3 +373,156 @@ export function classifyPrompt(record) {
     }
     return { owner: PROMPT_OWNER_MAIN, isUserAuthored: true, setsGoal: true, reason: "user" };
 }
+
+// The host announces a finished sub-agent to the main agent unless the task is cancelled first,
+// and polling for the reply can only race that announcement. `onSubagentStop` is the one point
+// where the race is decided in advisor's favour. Measured on 1.0.99-2: a cancel of the exact agent,
+// awaited inside the hook, produced no notification in 4 of 4 runs, whereas `modifiedResponse`
+// does not suppress it.
+//
+// One capture describes one review. `start` records the agent id once `startAgent` returns —
+// the stop can arrive before that, so a stop waits briefly for it — and `settle` hands the
+// captured reply to the polling loop.
+export function createReviewCapture() {
+    let resolveStarted;
+    let resolveSettled;
+    const capture = {
+        agentId: null,
+        claimed: false,
+        done: false,
+        started: new Promise((resolve) => (resolveStarted = resolve)),
+        settled: new Promise((resolve) => (resolveSettled = resolve)),
+        start(id) {
+            if (capture.agentId === null && typeof id === "string" && id) capture.agentId = id;
+            resolveStarted(capture.agentId);
+        },
+        settle(value) {
+            resolveSettled(value);
+        },
+    };
+    return capture;
+}
+
+function waitBounded(promise, ms) {
+    let timer;
+    const timeout = new Promise((resolve) => (timer = setTimeout(() => resolve(null), ms)));
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Ownership is the exact agent id `startAgent` returned, never a prompt or model match: cancelling
+// a stop that is not advisor's would kill the user's own sub-agent. The cancel is awaited before
+// settling so the review cannot return — and dispose the task — while the cancel is in flight.
+// A failed cancel is still settled: the reply is valid either way, and only the notification is lost.
+export async function captureOwnedStop(capture, input, { cancel, startWaitMs = 0 } = {}) {
+    const notOwned = { owned: false };
+    const id = input?.agentId;
+    if (!capture || capture.done || capture.claimed) return notOwned;
+    if (typeof id !== "string" || id === "") return notOwned;
+
+    if (capture.agentId === null) await waitBounded(capture.started, startWaitMs);
+    if (capture.agentId !== id || capture.done || capture.claimed) return notOwned;
+
+    capture.claimed = true;
+    const response = typeof input.response === "string" ? input.response : "";
+    let cancelled = false;
+    let cancelError = null;
+    try {
+        cancelled = (await cancel(id))?.cancelled === true;
+    } catch (err) {
+        cancelError = err?.message ?? String(err);
+    }
+    const outcome = { response, cancelled, cancelError };
+    capture.settle(outcome);
+    return { owned: true, ...outcome };
+}
+
+// HydraFusion runs a turn as phases before committing one phase's work. A root-scope phase's work
+// is never in `getEvents()` while it runs — it arrives only through `session.on`, as ephemeral
+// events tagged `data.fusion.phaseId` with no `commitId` — so reviewing it means buffering it as it
+// streams. The commit then replays the selected phase as persisted events carrying a `commitId`
+// and the same call ids and content, which is what `fusionWorkKey` matches on. Measured on a
+// recorded cascade fusion on 1.0.99-2.
+const FUSION_WORK_EVENT_TYPES = new Set([
+    "assistant.message",
+    "assistant.intent",
+    "tool.execution_start",
+    "tool.execution_complete",
+]);
+
+// Review-scope phases (a judge or critic) run in an isolated history that never reaches the root
+// conversation, so their output is not the agent's work.
+export function isLivePhaseWork(event, phaseId) {
+    if (!phaseId || event?.agentId) return false;
+    if (!FUSION_WORK_EVENT_TYPES.has(event?.type)) return false;
+    const tag = event.data?.fusion;
+    return tag?.phaseId === phaseId && !tag.commitId && tag.conversationScope !== "review";
+}
+
+export function fusionWorkKey(event) {
+    const data = event?.data ?? {};
+    const phaseId = data.fusion?.phaseId;
+    if (!phaseId || !FUSION_WORK_EVENT_TYPES.has(event?.type)) return null;
+    const identity = data.toolCallId ?? data.content ?? data.intent;
+    if (typeof identity !== "string" || identity === "") return null;
+    return `${phaseId}|${event.type}|${identity}`;
+}
+
+export function createFusionPhase({ phaseId, phaseKind }, limit = 400) {
+    return { id: phaseId, kind: phaseKind || "unknown", events: [], dropped: 0, toolNames: new Map(), limit };
+}
+
+// A result can arrive after its call was drained by an earlier review, so tool names are kept for
+// the phase's lifetime rather than per drain, under the same bound as the events.
+export function bufferPhaseEvent(phase, event) {
+    if (event?.type === "tool.execution_start") {
+        const { toolCallId, toolName } = event.data ?? {};
+        if (toolCallId && toolName) {
+            phase.toolNames.set(toolCallId, toolName);
+            if (phase.toolNames.size > phase.limit) phase.toolNames.delete(phase.toolNames.keys().next().value);
+        }
+    }
+    phase.events.push(event);
+    if (phase.events.length > phase.limit) {
+        phase.events.shift();
+        phase.dropped++;
+    }
+}
+
+export function drainPhaseEvents(phase) {
+    const drained = { events: phase.events, dropped: phase.dropped };
+    phase.events = [];
+    phase.dropped = 0;
+    return drained;
+}
+
+// The phase may be discarded rather than committed, so the reviewer is told it is judging an
+// attempt in progress rather than the turn's final work.
+export function renderPhaseWork(phase, { events, dropped }, { maxToolResultChars = Infinity } = {}) {
+    const lines = events
+        .map((e) => renderEvent(e, { toolNames: phase.toolNames, maxToolResultChars }))
+        .filter(Boolean);
+    if (lines.length === 0) return [];
+    const header = `[HydraFusion ${phase.kind} phase in progress: provisional work that may not be kept]`;
+    return [header, ...(dropped > 0 ? [`…[${dropped} earlier phase events omitted]`] : []), ...lines];
+}
+
+// Sub-agent events are never the main agent's work. A commit replay of work already reviewed
+// live is dropped so the next review does not judge the same work twice as though it were new;
+// a replay of a phase that was never reviewed stays, as the committed record of what happened.
+export function selectReviewableEvents(events, reviewedKeys) {
+    return (events ?? []).filter((e) => {
+        if (e?.agentId) return false;
+        if (!e?.data?.fusion?.commitId) return true;
+        const key = fusionWorkKey(e);
+        return !(key && reviewedKeys?.has(key));
+    });
+}
+
+// A Set iterates in insertion order, so the first value is the oldest.
+export function rememberBounded(set, values, limit) {
+    for (const value of values) {
+        if (value === null || value === undefined) continue;
+        set.add(value);
+        if (set.size > limit) set.delete(set.values().next().value);
+    }
+}
