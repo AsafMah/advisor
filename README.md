@@ -379,9 +379,12 @@ recognised as a replay: each one that restarts at turn id `0` invalidates advice
 turn, and `fusion_completed` alone ends the pause. `session.fusion_handoff` is untyped too, so it
 is used only as a boundary.
 
-Live-phase review was measured against one `cascade` fusion (solver, judge, handoff, repair). Never
-observed: whether a blocker's tool-call denial takes effect inside a phase, the other fusion
-patterns, and phases running concurrently — which fail closed to the pause.
+Event shapes were measured on one `cascade` fusion (solver, judge, handoff, repair). The advisor
+itself was run through one `single` fusion: all eight reviews ran inside the live phase from the
+buffer, and three blockers each denied a tool call inside it, which the agent read and answered
+before continuing. The judge, handoff and overlap handling are covered by tests only. Never
+observed: the other fusion patterns and phases running concurrently — which fail closed to the
+pause.
 
 ## Cadence and backoff
 
@@ -591,12 +594,12 @@ JSON but not a verdict must not be accepted.
   and when the stop carries the exact agent id `startAgent` returned, the hook cancels that task
   and hands the reply to the review. Cancelling there, while the host still awaits the hook, is
   what keeps the "agent finished" notification out of the main agent's context: measured on
-  1.0.99-2, no notification in 4 of 4 runs, whereas returning `modifiedResponse` does not
-  suppress it. The hook never returns anything — `block` would keep the agent running and
-  `modifiedResponse` would rewrite a reply — and ignores every stop that is not the advisor's own,
-  since cancelling one would kill the user's sub-agent. When the stop's reply is blank or not a
-  verdict (an agent can follow its verdict with a remark), the latest parseable reply in the
-  event log is used instead.
+  1.0.99-2, no notification in 4 of 4 runs, and through the extension on 1.0.100-1, none in 15 of
+  15 reviews; returning `modifiedResponse` does not suppress it. The hook never returns anything —
+  `block` would keep the agent running and `modifiedResponse` would rewrite a reply — and ignores
+  every stop that is not the advisor's own, since cancelling one would kill the user's sub-agent.
+  When the stop's reply is blank or not a verdict (an agent can follow its verdict with a remark),
+  the latest parseable reply in the event log is used instead.
 - **Reply recovery.** Without the hook (an older host), or before it fires, the reply is read in
   order of reliability: `task.result`, then
   `task.latestResponse`, then the session event log. The first two are keyed by the task id the
